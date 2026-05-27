@@ -460,7 +460,7 @@ class LocalAgent:
         finally: spin.stop()
 
     def stream_command_output(self, exec_cmd: str, color_code: str = "90m") -> tuple[list[str], int]:
-        p = subprocess.Popen(exec_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, cwd=self.cwd)
+        p = subprocess.Popen(exec_cmd, shell=True, executable="/bin/bash", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, cwd=self.cwd)
         lines = []
         try:
             for l in p.stdout:
