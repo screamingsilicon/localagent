@@ -500,7 +500,7 @@ class LocalAgent:
             print(f"{BOLD}(y/n): {RESET}", end="", flush=True)
             try: 
                 if input().strip().lower() != 'y': self.log_tool_call("shell", False, {"denied": True}); return "Denied."
-            except KeyboardInterrupt: return "Denied."
+            except KeyboardInterrupt: self.log_tool_call("shell", False, {"denied": True}); return "Denied."
 
         effective_cmd = cmd
         if remote:
@@ -541,11 +541,13 @@ class LocalAgent:
 
             # Try reading with allow_escape to show the diff
             content, err = read_file(path, self.cwd, rem, allow_escape=True)
-            if err: return f"Error reading {path}: {err}"
+            if err:
+                self.log_tool_call("edit", False, {"err": err}); return f"Error reading {path}: {err}"
 
             try:
                 base, new = find_and_replace(normalize_text(content if content != "[empty]" else "", strict=True), f_txt, r_txt, path, strict=bool(rem))
-                if not (ok := check_syntax(path, new))[0]: return f"Syntax Error: {ok[1]}"
+                if not (ok := check_syntax(path, new))[0]:
+                    self.log_tool_call("edit", False, {"err": ok[1]}); return f"Syntax Error: {ok[1]}"
 
                 diff = format_diff(base, new)
                 print(f"\033[36mProposed changes:\033[0m")
@@ -558,25 +560,28 @@ class LocalAgent:
                             self.log_tool_call("edit", False, {"denied": True, "path": path})
                             return "Denied by user."
                     except KeyboardInterrupt:
-                        return "Denied by user."
+                        self.log_tool_call("edit", False, {"denied": True, "path": path}); return "Denied by user."
 
-                if err := write_file(path, new, self.cwd, rem, allow_escape=True): return f"Write failed: {err}"
+                if err := write_file(path, new, self.cwd, rem, allow_escape=True):
+                    self.log_tool_call("edit", False, {"err": err}); return f"Write failed: {err}"
             except Exception as e:
                 self.log_tool_call("edit", False, {"err": str(e)}); return f"Edit failed: {e}"
 
         elif err:
-            return f"Error reading {path}: {err}"
+            self.log_tool_call("edit", False, {"err": err}); return f"Error reading {path}: {err}"
 
         else:
             try:
                 base, new = find_and_replace(normalize_text(content if content != "[empty]" else "", strict=True), f_txt, r_txt, path, strict=bool(rem))
-                if not (ok := check_syntax(path, new))[0]: return f"Syntax Error: {ok[1]}"
+                if not (ok := check_syntax(path, new))[0]:
+                    self.log_tool_call("edit", False, {"err": ok[1]}); return f"Syntax Error: {ok[1]}"
 
                 diff = format_diff(base, new)
                 print(f"\033[36m[Edit] {rem or 'local'} -> {path}\033[0m")
                 for l in diff.splitlines(): print(f"\033[{'32m' if l.startswith('+') else '31m' if l.startswith('-') else '90m'}{l}\033[0m")
 
-                if err := write_file(path, new, self.cwd, rem): return f"Write failed: {err}"
+                if err := write_file(path, new, self.cwd, rem):
+                    self.log_tool_call("edit", False, {"err": err}); return f"Write failed: {err}"
             except Exception as e:
                 self.log_tool_call("edit", False, {"err": str(e)}); return f"Edit failed: {e}"
 
@@ -586,7 +591,8 @@ class LocalAgent:
     def execute_write(self, act: dict[str, Any]) -> str:
         path, rem, content = act["path"], act["remote"], act["content"]
         if not path: return "Error: missing 'path'."
-        if not (ok := check_syntax(path, content))[0]: return f"Syntax Error: {ok[1]}"
+        if not (ok := check_syntax(path, content))[0]:
+            self.log_tool_call("write", False, {"err": ok[1], "path": path}); return f"Syntax Error: {ok[1]}"
 
         # Check if path escapes repo boundary
         if self._is_path_escape(path):
@@ -603,7 +609,7 @@ class LocalAgent:
                         self.log_tool_call("write", False, {"denied": True, "path": path})
                         return "Denied by user."
                 except KeyboardInterrupt:
-                    return "Denied by user."
+                    self.log_tool_call("write", False, {"denied": True, "path": path}); return "Denied by user."
 
             if err := write_file(path, content, self.cwd, rem, allow_escape=True):
                 self.log_tool_call("write", False, {"err": err}); return f"Write failed: {err}"
