@@ -263,15 +263,19 @@ def set_terminal_title(t: str) -> None:
 # Filesystem & IO Wrappers
 # =========================================================================
 
-def read_file(path: str, base_dir: str, remote: str | None = None) -> tuple[str | None, str | None]:
+def read_file(path: str, base_dir: str, remote: str | None = None, allow_escape: bool = False) -> tuple[str | None, str | None]:
     if remote:
         p = subprocess.run(f"ssh {remote} \"cat '{path}'\"", shell=True, capture_output=True, text=True)
         return (p.stdout, None) if p.returncode == 0 else (None, p.stderr.strip())
     try:
         p = Path(base_dir, Path(path).expanduser()).resolve(strict=False)
-        if not p.is_relative_to(Path(base_dir).resolve()): return None, "path escapes repo boundary"
+        base_resolved = Path(base_dir).resolve()
+        if not allow_escape and not p.is_relative_to(base_resolved): return None, "path_escapes"
         if not p.exists(): return None, "not found"
-        if p.is_symlink() and not p.resolve().is_relative_to(Path(base_dir).resolve()): return None, "symlink escapes repo"
+        if p.is_symlink():
+            resolved_link = p.resolve()
+            if not allow_escape and not resolved_link.is_relative_to(base_resolved):
+                return None, "symlink escapes repo boundary"
         if not stat.S_ISREG(p.stat().st_mode): return None, "not a regular file"
         if p.stat().st_size > MAX_FILE_SIZE: return None, "file too large"
         content = p.read_text(encoding="utf-8")
@@ -279,7 +283,7 @@ def read_file(path: str, base_dir: str, remote: str | None = None) -> tuple[str 
     except UnicodeDecodeError: return None, "binary/not UTF-8"
     except Exception as e: return None, str(e)
 
-def write_file(path: str, content: str, base_dir: str, remote: str | None = None) -> str | None:
+def write_file(path: str, content: str, base_dir: str, remote: str | None = None, allow_escape: bool = False) -> str | None:
     if remote:
         tmp = f"{path}.tmp.{random.randint(100000, 999999)}"
         p = subprocess.run(
@@ -289,7 +293,8 @@ def write_file(path: str, content: str, base_dir: str, remote: str | None = None
         return p.stderr.strip() if p.returncode != 0 else None
     try:
         p = Path(base_dir, Path(path).expanduser()).resolve(strict=False)
-        if not p.is_relative_to(Path(base_dir).resolve()): return "path escapes repo boundary"
+        base_resolved = Path(base_dir).resolve()
+        if not allow_escape and not p.is_relative_to(base_resolved): return "path_escapes"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         return None
@@ -516,36 +521,99 @@ class LocalAgent:
         self.log_tool_call("shell", rcode == 0, {"cmd": cmd})
         return f"Command: {cmd}\nExit Code: {rcode}\nOutput:\n{out}"
 
+    def _is_path_escape(self, path: str) -> bool:
+        """Check if the given path resolves outside of self.cwd."""
+        try:
+            resolved = Path(self.cwd, Path(path).expanduser()).resolve()
+            return not resolved.is_relative_to(Path(self.cwd).resolve())
+        except Exception:
+            return False
+
     def execute_edit(self, act: dict[str, Any]) -> str:
         path, rem, f_txt, r_txt = act["path"], act["remote"], act["find"], act["replace"]
+
+        # First try read with normal boundaries
         content, err = read_file(path, self.cwd, rem)
-        if err: return f"Error reading {path}: {err}"
+        if err == "path_escapes":
+            # Path is outside cwd — prompt for approval
+            escape_path = Path(self.cwd, Path(path).expanduser()).resolve()
+            print(f"\033[33m⚠ [Edit] Path escapes repo boundary: {escape_path}\033[0m")
 
-        try:
-            base, new = find_and_replace(normalize_text(content if content != "[empty]" else "", strict=True), f_txt, r_txt, path, strict=bool(rem))
-            if not (ok := check_syntax(path, new))[0]: return f"Syntax Error: {ok[1]}"
+            # Try reading with allow_escape to show the diff
+            content, err = read_file(path, self.cwd, rem, allow_escape=True)
+            if err: return f"Error reading {path}: {err}"
 
-            diff = format_diff(base, new)
-            print(f"\033[36m[Edit] {rem or 'local'} -> {path}\033[0m")
-            for l in diff.splitlines(): print(f"\033[{'32m' if l.startswith('+') else '31m' if l.startswith('-') else '90m'}{l}\033[0m")
+            try:
+                base, new = find_and_replace(normalize_text(content if content != "[empty]" else "", strict=True), f_txt, r_txt, path, strict=bool(rem))
+                if not (ok := check_syntax(path, new))[0]: return f"Syntax Error: {ok[1]}"
 
-            if err := write_file(path, new, self.cwd, rem): return f"Write failed: {err}"
-            self.log_tool_call("edit", True, {"path": path})
-            return f"Successfully edited {path}\n\nDiff:\n{diff}"
-        except Exception as e:
-            self.log_tool_call("edit", False, {"err": str(e)}); return f"Edit failed: {e}"
+                diff = format_diff(base, new)
+                print(f"\033[36mProposed changes:\033[0m")
+                for l in diff.splitlines(): print(f"\033[{'32m' if l.startswith('+') else '31m' if l.startswith('-') else '90m'}{l}\033[0m")
+
+                if not self.auto_mode:
+                    print(f"{BOLD}(Approve? y/n): {RESET}", end="", flush=True)
+                    try:
+                        if input().strip().lower() != 'y':
+                            self.log_tool_call("edit", False, {"denied": True, "path": path})
+                            return "Denied by user."
+                    except KeyboardInterrupt:
+                        return "Denied by user."
+
+                if err := write_file(path, new, self.cwd, rem, allow_escape=True): return f"Write failed: {err}"
+            except Exception as e:
+                self.log_tool_call("edit", False, {"err": str(e)}); return f"Edit failed: {e}"
+
+        elif err:
+            return f"Error reading {path}: {err}"
+
+        else:
+            try:
+                base, new = find_and_replace(normalize_text(content if content != "[empty]" else "", strict=True), f_txt, r_txt, path, strict=bool(rem))
+                if not (ok := check_syntax(path, new))[0]: return f"Syntax Error: {ok[1]}"
+
+                diff = format_diff(base, new)
+                print(f"\033[36m[Edit] {rem or 'local'} -> {path}\033[0m")
+                for l in diff.splitlines(): print(f"\033[{'32m' if l.startswith('+') else '31m' if l.startswith('-') else '90m'}{l}\033[0m")
+
+                if err := write_file(path, new, self.cwd, rem): return f"Write failed: {err}"
+            except Exception as e:
+                self.log_tool_call("edit", False, {"err": str(e)}); return f"Edit failed: {e}"
+
+        self.log_tool_call("edit", True, {"path": path})
+        return f"Successfully edited {path}\n\nDiff:\n{diff}"
 
     def execute_write(self, act: dict[str, Any]) -> str:
         path, rem, content = act["path"], act["remote"], act["content"]
         if not path: return "Error: missing 'path'."
         if not (ok := check_syntax(path, content))[0]: return f"Syntax Error: {ok[1]}"
 
-        if err := write_file(path, content, self.cwd, rem):
-            self.log_tool_call("write", False, {"err": err}); return f"Write failed: {err}"
-            
-        print(f"\033[36m[Write] {rem or 'local'} -> {path}\033[0m")
-        for l in content.splitlines()[:10]: print(f"\033[32m+{l}\033[0m")
-        if len(content.splitlines()) > 10: print(f"\033[32m... ({len(content.splitlines())} lines written)\033[0m")
+        # Check if path escapes repo boundary
+        if self._is_path_escape(path):
+            escape_path = Path(self.cwd, Path(path).expanduser()).resolve()
+            print(f"\033[33m⚠ [Write] Path escapes repo boundary: {escape_path}\033[0m")
+            print(f"\033[36mProposed file content ({len(content.splitlines())} lines):\033[0m")
+            for l in content.splitlines()[:10]: print(f"\033[32m+{l}\033[0m")
+            if len(content.splitlines()) > 10: print(f"\033[32m... ({len(content.splitlines()) - 10} more lines)\033[0m")
+
+            if not self.auto_mode:
+                print(f"{BOLD}(Approve? y/n): {RESET}", end="", flush=True)
+                try:
+                    if input().strip().lower() != 'y':
+                        self.log_tool_call("write", False, {"denied": True, "path": path})
+                        return "Denied by user."
+                except KeyboardInterrupt:
+                    return "Denied by user."
+
+            if err := write_file(path, content, self.cwd, rem, allow_escape=True):
+                self.log_tool_call("write", False, {"err": err}); return f"Write failed: {err}"
+        else:
+            if err := write_file(path, content, self.cwd, rem):
+                self.log_tool_call("write", False, {"err": err}); return f"Write failed: {err}"
+
+            print(f"\033[36m[Write] {rem or 'local'} -> {path}\033[0m")
+            for l in content.splitlines()[:10]: print(f"\033[32m+{l}\033[0m")
+            if len(content.splitlines()) > 10: print(f"\033[32m... ({len(content.splitlines())} lines written)\033[0m")
 
         self.log_tool_call("write", True, {"path": path})
         return f"Wrote content to {path}"
