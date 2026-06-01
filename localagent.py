@@ -353,12 +353,18 @@ def format_inline_markdown(text: str, restore: str = RESET) -> str:
     ph = {}
     _m = lambda prefix: f"\x01{prefix}{len(ph)}\x04"
 
-    text = re.sub(r'(</?(?:shell|edit|find|replace|write)\b[^>]*>)', lambda m: ph.setdefault(_m("XML"), f"{XML_BG}{m.group(1)}{restore}"), text)
-    text = re.sub(r'(?<!`)`([^`\n]+)`(?!`)', lambda m: ph.setdefault(_m("CODE"), f"{CODE_BG}{m.group(1)}{restore}"), text)
-    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', lambda m: ph.setdefault(_m("LNK"), f"\033]8;;{m.group(2)}\033\\{LINK_TEXT}{m.group(1)}{restore}\033]8;;\033\\"), text)
+    text = re.sub(r'(</?(?:shell|edit|find|replace|write)\b[^>]*>)', lambda m: ph.setdefault(_m("XML"), f"{XML_BG}{m.group(1)}{RESET}{restore}"), text)
+    text = re.sub(r'(?<!`)`([^`\n]+)`(?!`)', lambda m: ph.setdefault(_m("CODE"), f"{CODE_BG}{m.group(1)}{RESET}{restore}"), text)
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', lambda m: ph.setdefault(_m("LNK"), f"\033]8;;{m.group(2)}\033\\{LINK_TEXT}{m.group(1)}{RESET}{restore}\033]8;;\033\\"), text)
 
-    for pat, style in [(r'\*\*(.+?)\*\*', BOLD), (r'__(.+?)__', BOLD), (r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', ITALIC), (r'(?<!_)_(?!_)(.+?)(?<!_)_(?!_)', ITALIC), (r'~~(.+?)~~', STRIKE)]:
-        text = re.sub(pat, lambda m: f"{style}{m.group(1)}{restore}", text)
+    for pat, style in [
+        (r'\*\*(.+?)\*\*', BOLD), 
+        (r'(?<!\w)__(.+?)__(?!\w)', BOLD), 
+        (r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', ITALIC), 
+        (r'(?<!\w)_(?!_)(.+?)(?<!_)_(?!\w)', ITALIC), 
+        (r'~~(.+?)~~', STRIKE)
+    ]:
+        text = re.sub(pat, lambda m: f"{style}{m.group(1)}{RESET}{restore}", text)
 
     for k in reversed(list(ph.keys())): text = text.replace(k, ph[k])
     return text
