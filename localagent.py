@@ -36,7 +36,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         prog="localagent",
         description="localagent – AI-powered terminal agent for shell execution, file editing, and writing.",
-        epilog="Examples:\n  %(prog)s                      Start interactive REPL\n  %(prog)s --yolo                 Start in auto-execute mode\n  %(prog)s --sandbox              Run inside a secure Docker sandbox\n  %(prog)s \"fix the auth bug\"     One-shot: run a task and exit\n",
+        epilog="Examples:\n  %(prog)s                Start interactive REPL\n  %(prog)s --yolo                 Start in auto-execute mode\n  %(prog)s --sandbox              Run inside a secure Docker sandbox\n  %(prog)s \"fix the auth bug\"     One-shot: run a task and exit\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("-y", "--yolo", action="store_true", help="Enable auto-execute mode (skip y/n confirmations)")
@@ -61,28 +61,22 @@ MODEL = _ARGS.model or os.getenv("LLM_MODEL", "local-model")
 TEMPERATURE = _ARGS.temperature if _ARGS.temperature is not None else float(os.getenv("LLM_TEMPERATURE", "0.7"))
 HTTP_REQUEST_TIMEOUT = 600
 
-# --- Dynamic context sizing (fetched from /v1/models at startup) ---
-# Percentages of the model's actual n_ctx
-_COMPRESS_PCT      = 0.50   # light compression kicks in at 50%
-_SUMMARIZE_PCT     = 0.70   # full summarization at 70%
-_TURN_PREFIX_PCT   = 0.20   # keep last 20% of context after summarization
-_MAX_TOKENS_PCT    = 0.85   # leave 15% headroom for the model's response
+# --- Dynamic context sizing ---
+_COMPRESS_PCT      = 0.50
+_SUMMARIZE_PCT     = 0.70
+_TURN_PREFIX_PCT   = 0.20
+_MAX_TOKENS_PCT    = 0.85
 
-# Defaults when /v1/models returns no meta
 _FALLBACK_N_CTX = 90000
 _FALLBACK_MODEL_TAG = ""
 
 
 def _extract_quant(model_id: str) -> str:
-    """Pull a quant tag like Q6_K_XL from a model ID."""
     m = re.search(r'(Q\d+_[A-Z0-9_]+(?:\.\d+)?)', model_id)
     return m.group(1) if m else ""
 
 
 def _fetch_model_info():
-    """Query /v1/models, return (n_ctx, model_id, quant_tag).
-    Retries on transient network/DNS errors (common in Docker sandbox
-    where the proxy container's DNS entry may not be ready yet)."""
     req = urllib.request.Request(
         f"{LLM_HOST}/v1/models",
         headers={"Content-Type": "application/json"},
@@ -97,7 +91,7 @@ def _fetch_model_info():
         except urllib.error.URLError as e:
             if attempt == retries:
                 raise
-            wait = 1.0 * attempt  # 1s, 2s, 3s ...
+            wait = 1.0 * attempt
             print(f"[!] /v1/models unreachable (attempt {attempt}/{retries}): {e.reason}. Retrying in {wait:.0f}s...", file=sys.stderr)
             time.sleep(wait)
     else:
@@ -120,9 +114,12 @@ def _fetch_model_info():
 
 
 def _resolve_context_limits():
-    """Query /v1/models for n_ctx, derive all token thresholds as percentages."""
-    n_ctx, model_id, quant_tag = _fetch_model_info()
-    n_ctx = _ARGS.n_ctx or int(os.getenv("LLM_N_CTX", n_ctx))  # CLI arg or env override possible
+    try:
+        n_ctx, model_id, quant_tag = _fetch_model_info()
+    except Exception:
+        n_ctx, model_id, quant_tag = _FALLBACK_N_CTX, _FALLBACK_MODEL_TAG, ""
+    
+    n_ctx = _ARGS.n_ctx or int(os.getenv("LLM_N_CTX", n_ctx))
 
     context_window     = n_ctx
     max_tokens         = int(n_ctx * _MAX_TOKENS_PCT)
@@ -137,7 +134,6 @@ CONTEXT_WINDOW, MAX_TOKENS, LOCALAGENT_COMPRESS_THRESHOLD, LOCALAGENT_SUMMARIZE_
 
 
 def _model_tag() -> str:
-    """Build a compact model tag like 'unsloth/Qwen3.6-27B-MTP-GGUF (Q6_K_XL) - 128k ctx'."""
     if not _MODEL_ID:
         return ""
     name = _MODEL_ID.split(":")[0]
@@ -147,6 +143,8 @@ def _model_tag() -> str:
 MAX_FILE_SIZE = 256 * 1024
 
 RESET, BOLD, ITALIC, STRIKE, CLEAR_LINE = "\033[0m", "\033[1m", "\033[3m", "\033[9m", "\033[K"
+THINK_COLOR = "\033[3;90m"
+INLINE_CODE_BG = "\033[48;5;238m"
 H1_COLOR, H2_COLOR, H3_COLOR = "\033[1;4;38;5;213m", "\033[1;38;5;213m", "\033[1;38;5;177m"
 CODE_BG, XML_BG = "\033[48;5;236;38;5;253m", "\033[48;5;129;38;5;255m"
 QUOTE_COLOR, LIST_BULLET, TABLE_BORDER = "\033[38;5;245;3m", "\033[38;5;214m", "\033[38;5;239m"
@@ -201,7 +199,7 @@ Remote SSH:
 content here
 </write>
 
-For <shell> tags: only one per response. Wait for the result before running the next shell command.
+For <shell> tags: use at most one per reply. Wait for the result before running the next shell command.
 You may include multiple <edit> and/or <write> tags in a single response.
 """
 
@@ -349,45 +347,84 @@ def parse_xml_actions(text: str) -> list[dict[str, Any]]:
 # Markdown & Visuals
 # =========================================================================
 
-def format_inline_markdown(text: str, restore: str = RESET) -> str:
-    ph = {}
-    _m = lambda prefix: f"\x01{prefix}{len(ph)}\x04"
-
-    text = re.sub(r'(</?(?:shell|edit|find|replace|write)\b[^>]*>)', lambda m: ph.setdefault(_m("XML"), f"{XML_BG}{m.group(1)}{RESET}{restore}"), text)
-    text = re.sub(r'(?<!`)`([^`\n]+)`(?!`)', lambda m: ph.setdefault(_m("CODE"), f"{CODE_BG}{m.group(1)}{RESET}{restore}"), text)
-    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', lambda m: ph.setdefault(_m("LNK"), f"\033]8;;{m.group(2)}\033\\{LINK_TEXT}{m.group(1)}{RESET}{restore}\033]8;;\033\\"), text)
-
-    for pat, style in [
-        (r'\*\*(.+?)\*\*', BOLD), 
-        (r'(?<!\w)__(.+?)__(?!\w)', BOLD), 
-        (r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', ITALIC), 
-        (r'(?<!\w)_(?!_)(.+?)(?<!_)_(?!\w)', ITALIC), 
-        (r'~~(.+?)~~', STRIKE)
-    ]:
-        text = re.sub(pat, lambda m: f"{style}{m.group(1)}{RESET}{restore}", text)
-
-    for k in reversed(list(ph.keys())): text = text.replace(k, ph[k])
-    return text
-
 def render_md(text: str) -> str:
-    res, w = [], shutil.get_terminal_size((80, 20)).columns
-    for part in re.split(r"(```[\s\S]*?```)", text):
-        if part.startswith("```"):
-            lines = part[3:-3].strip().split('\n')
-            if lines and lines[0].strip().isalnum(): lines = lines[1:]
-            res.extend(["", *(f"{CODE_BG}{l.ljust(w)}{CLEAR_LINE}{RESET}" for l in lines), ""])
-        else:
-            for l in part.split('\n'):
-                s = l.strip()
-                if l.startswith('# '): res.append(f"{H1_COLOR}{format_inline_markdown(l[2:], H1_COLOR)}{RESET}")
-                elif l.startswith('## '): res.append(f"{H2_COLOR}{format_inline_markdown(l[3:], H2_COLOR)}{RESET}")
-                elif l.startswith('### '): res.append(f"{H3_COLOR}{format_inline_markdown(l[4:], H3_COLOR)}{RESET}")
-                elif l.startswith('> '): res.append(f"{QUOTE_COLOR}▌ {format_inline_markdown(l[2:], QUOTE_COLOR)}{RESET}")
-                elif m := re.match(r'^(\s*)[*+-]\s+(.*)', l): res.append(f"{m.group(1)}{LIST_BULLET}•{RESET} {format_inline_markdown(m.group(2))}")
-                elif m := re.match(r'^(\s*\d+)\.\s+(.*)', l): res.append(f"{LIST_BULLET}{m.group(1)}.{RESET} {format_inline_markdown(m.group(2))}")
-                elif re.match(r'^[\s]*([-*_])\1{2,}\s*$', s): res.append(f"{TABLE_BORDER} {'─' * (w - 2)} {RESET}")
-                else: res.append(format_inline_markdown(l))
-    return re.sub(r'\n{3,}', '\n\n', "\n".join(res)).strip()
+    if not text.strip():
+        return ""
+        
+    w = shutil.get_terminal_size((80, 20)).columns
+
+    # 1. Intercept and parse fully buffered XML Tool Blocks
+    m = re.match(r'^\s*<(?P<tag>shell|edit|write)(?:[^>]*path="(?P<path>[^"]+)")?(?:[^>]*remote="(?P<remote>[^"]+)")?[^>]*>\n?(?P<inner>[\s\S]*?)\n?</\1>\s*$', text)
+    if m:
+        tag = m.group("tag")
+        path = m.group("path") or ""
+        remote = m.group("remote") or "local"
+        inner = m.group("inner").strip('\r\n')
+        
+        res = [""]
+        
+        if tag == "write":
+            header = f" [WRITE] {path} " + (f"({remote})" if remote != "local" else "")
+            h_bg = "\033[48;5;31m\033[38;5;255m"  
+            b_bg = "\033[48;5;236m\033[38;5;252m" 
+            
+            res.append(f"{h_bg}{BOLD}{header.ljust(w)}{CLEAR_LINE}{RESET}")
+            for l in inner.split('\n'):
+                res.append(f"{b_bg}  {l.ljust(w - 2)}{CLEAR_LINE}{RESET}")
+                
+        elif tag == "edit":
+            header = f" [EDIT] {path} " + (f"({remote})" if remote != "local" else "")
+            h_bg = "\033[48;5;96m\033[38;5;255m"  
+            b_bg = "\033[48;5;236m\033[38;5;252m"
+            
+            res.append(f"{h_bg}{BOLD}{header.ljust(w)}{CLEAR_LINE}{RESET}")
+            
+            f_m = re.search(r'<find>\n?([\s\S]*?)\n?</find>', inner)
+            r_m = re.search(r'<replace>\n?([\s\S]*?)\n?</replace>', inner)
+            
+            if f_m and r_m:
+                for l in f_m.group(1).strip('\r\n').split('\n'):
+                    res.append(f"{b_bg} \033[38;5;196m - {l.ljust(w - 4)}{CLEAR_LINE}{RESET}")
+                for l in r_m.group(1).strip('\r\n').split('\n'):
+                    res.append(f"{b_bg} \033[38;5;46m + {l.ljust(w - 4)}{CLEAR_LINE}{RESET}")
+            else:
+                for l in inner.split('\n'):
+                    res.append(f"{b_bg}  {l.ljust(w - 2)}{CLEAR_LINE}{RESET}")
+
+        elif tag == "shell":
+            header = f" [SHELL] {remote} " if remote != "local" else " [SHELL] "
+            h_bg = "\033[48;5;239m\033[38;5;255m"  
+            b_bg = "\033[48;5;235m\033[38;5;250m" 
+            
+            res.append(f"{h_bg}{BOLD}{header.ljust(w)}{CLEAR_LINE}{RESET}")
+            for l in inner.split('\n'):
+                res.append(f"{b_bg}  $ {l.ljust(w - 4)}{CLEAR_LINE}{RESET}")
+
+        res.append("")
+        return "\n".join(res)
+
+    # 2. Handle standard single lines (Headers, Lists, Inline bold & code)
+    is_header = text.startswith("# ") or text.startswith("## ")
+    
+    if text.startswith("# "):
+        t = text[2:]
+    elif text.startswith("## "):
+        t = text[3:]
+    else:
+        t = text
+    
+    base_color = f"{H1_COLOR}{BOLD}" if is_header else RESET
+    
+    t = re.sub(r'\*\*(.+?)\*\*', lambda m: f"{BOLD}{m.group(1)}{base_color}", t)
+    t = re.sub(r'`([^`]+)`', lambda m: f"{INLINE_CODE_BG} {m.group(1)} \033[49m{base_color}", t)
+
+    if is_header:
+        return f"\n{H1_COLOR}{BOLD}{t}{RESET}"
+    elif t.startswith("- ") or t.startswith("* "):
+        return f"{LIST_BULLET}•{RESET} {t[2:]}"
+    
+    return t
+
 
 class Spinner:
     def __init__(self): self.stop_event = threading.Event()
@@ -420,7 +457,6 @@ class LocalAgent:
         self._sudo_password_cache: dict[str, str] = {}
 
     def _get_sudo_password(self, remote: str) -> str | None:
-        """Retrieve or prompt for a cached sudo password for a remote host."""
         encoded = self._sudo_password_cache.get(remote)
         if encoded:
             return base64.b64decode(encoded).decode()
@@ -460,16 +496,195 @@ class LocalAgent:
                             except: pass
             sessions.append(meta)
         return sessions
+    
+    def llm_request(self, msgs: list[dict[str, Any]], stream: bool = False) -> dict[str, Any] | None:
+        payload = {
+            "model": MODEL,
+            "messages": msgs,
+            "temperature": TEMPERATURE,
+            "max_tokens": MAX_TOKENS,
+            "cache_prompt": True
+        }
+        if stream:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
 
-    def llm_request(self, msgs: list[dict[str, Any]]) -> dict[str, Any] | None:
-        req = urllib.request.Request(f"{LLM_HOST}/v1/chat/completions", headers={"Content-Type": "application/json"}, data=json.dumps({"model": MODEL, "messages": msgs, "temperature": TEMPERATURE, "max_tokens": MAX_TOKENS, "cache_prompt": True}).encode())
-        spin = Spinner(); spin.start()
+        req = urllib.request.Request(
+            f"{LLM_HOST}/v1/chat/completions",
+            headers={"Content-Type": "application/json"},
+            data=json.dumps(payload).encode()
+        )
+        
+        spin = Spinner()
+        spin.start()
+        
         try:
-            with urllib.request.urlopen(req, timeout=HTTP_REQUEST_TIMEOUT) as r: return json.loads(r.read().decode())
-        except KeyboardInterrupt: raise
-        except Exception as e: print(f"\033[31m[API Error: {e}]\033[0m"); return None
-        finally: spin.stop()
+            if not stream:
+                with urllib.request.urlopen(req, timeout=HTTP_REQUEST_TIMEOUT) as r:
+                    spin.stop()
+                    return json.loads(r.read().decode())
+            else:
+                with urllib.request.urlopen(req, timeout=HTTP_REQUEST_TIMEOUT) as r:
+                    spin.stop()
+                    
+                    full_text = ""
+                    usage_data = {}
+                    timing_data = {}
+                    in_native_think = False
+                    in_simulated_think = False
+                    raw_buffer = ""
+                    md_buffer = ""
 
+                    def flush_md_buffer():
+                        nonlocal md_buffer
+                        while md_buffer:
+                            s_stripped = md_buffer.lstrip(" \t\r\n")
+                            if not s_stripped:
+                                break
+                                
+                            block_found = False
+                            is_buffering_xml = False
+                            
+                            for tag in ["write", "edit", "shell"]:
+                                start_sig = f"<{tag}"
+                                end_sig = f"</{tag}>"
+                                
+                                if s_stripped.startswith(start_sig):
+                                    end_idx = md_buffer.find(end_sig)
+                                    if end_idx != -1:
+                                        block_len = end_idx + len(end_sig)
+                                        block = md_buffer[:block_len]
+                                        md_buffer = md_buffer[block_len:]
+                                        rendered = render_md(block)
+                                        if rendered:
+                                            print(rendered)
+                                        block_found = True
+                                        break 
+                                    else:
+                                        is_buffering_xml = True
+                                        break
+                                elif start_sig.startswith(s_stripped):
+                                    is_buffering_xml = True
+                                    break
+                                    
+                            if block_found:
+                                continue
+                                
+                            if is_buffering_xml:
+                                return
+                                
+                            if "\n" in md_buffer:
+                                line_end = md_buffer.find("\n")
+                                line = md_buffer[:line_end]
+                                md_buffer = md_buffer[line_end + 1:]
+                                
+                                rendered = render_md(line)
+                                if rendered:
+                                    print(rendered)
+                                continue
+                            
+                            break 
+                    
+                    for line in r:
+                        line = line.decode('utf-8').strip()
+                        if not line or line.startswith(":"):
+                            continue
+                        if line == "data: [DONE]":
+                            break
+                        if line.startswith("data: "):
+                            try:
+                                chunk = json.loads(line[6:])
+                            except json.JSONDecodeError:
+                                continue
+                            
+                            # Grab both usage and timings
+                            if "usage" in chunk and chunk["usage"]:
+                                usage_data = chunk["usage"]
+                            if "timings" in chunk and chunk["timings"]:
+                                timing_data = chunk["timings"]
+                            
+                            choices = chunk.get("choices", [])
+                            if not choices:
+                                continue
+                                
+                            delta = choices[0].get("delta", {})
+                            content = delta.get("content", "")
+                            reasoning = delta.get("reasoning_content", "")
+                            
+                            if reasoning:
+                                if not in_native_think:
+                                    print(THINK_COLOR, end="", flush=True)
+                                    in_native_think = True
+                                    full_text += "<think>\n"
+                                print(reasoning, end="", flush=True)
+                                full_text += reasoning
+                                
+                            if in_native_think and content:
+                                print(RESET + "\n", end="", flush=True)
+                                in_native_think = False
+                                full_text += "\n</think>\n"
+                                
+                            if content:
+                                full_text += content
+                                raw_buffer += content
+                                
+                                while raw_buffer:
+                                    if not in_simulated_think:
+                                        if "<think>" in raw_buffer:
+                                            before, _, after = raw_buffer.partition("<think>")
+                                            if before:
+                                                md_buffer += before
+                                                flush_md_buffer()
+                                            print(THINK_COLOR, end="", flush=True)
+                                            in_simulated_think = True
+                                            raw_buffer = after
+                                        else:
+                                            last_open = raw_buffer.rfind("<")
+                                            if last_open != -1 and not raw_buffer.endswith(">") and "think".startswith(raw_buffer[last_open+1:]):
+                                                md_buffer += raw_buffer[:last_open]
+                                                raw_buffer = raw_buffer[last_open:]
+                                                break 
+                                            else:
+                                                md_buffer += raw_buffer
+                                                raw_buffer = ""
+                                                flush_md_buffer()
+                                    else:
+                                        if "</think>" in raw_buffer:
+                                            before, _, after = raw_buffer.partition("</think>")
+                                            print(before, end="", flush=True)
+                                            print(RESET + "\n", end="", flush=True)
+                                            in_simulated_think = False
+                                            raw_buffer = after
+                                        else:
+                                            last_open = raw_buffer.rfind("<")
+                                            if last_open != -1 and not raw_buffer.endswith(">") and "/think".startswith(raw_buffer[last_open+1:]):
+                                                print(raw_buffer[:last_open], end="", flush=True)
+                                                raw_buffer = raw_buffer[last_open:]
+                                                break
+                                            else:
+                                                print(raw_buffer, end="", flush=True)
+                                                raw_buffer = ""
+                                        
+                    if in_native_think or in_simulated_think:
+                        print(RESET, end="", flush=True)
+                        
+                    if md_buffer.strip():
+                        rendered = render_md(md_buffer)
+                        if rendered:
+                            print(rendered)
+                            
+                    print()
+                    # Return timings alongside usage
+                    return {"content": full_text, "usage": usage_data, "timings": timing_data}
+                    
+        except KeyboardInterrupt:
+            spin.stop()
+            raise
+        except Exception as e:
+            spin.stop()
+            print(f"\033[31m[API Error: {e}]\033[0m")
+            return None
+        
     def stream_command_output(self, exec_cmd: str, color_code: str = "90m") -> tuple[list[str], int]:
         p = subprocess.Popen(exec_cmd, shell=True, executable="/bin/bash", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, cwd=self.cwd)
         lines = []
@@ -486,13 +701,11 @@ class LocalAgent:
         return lines, p.returncode
 
     def _wrap_sudo_cmd(self, cmd: str, remote: str) -> tuple[str, str]:
-        """If cmd contains sudo and we have a password, wrap with sudo -S.
-        Returns (effective_cmd_for_ssh, cmd_to_log_and_display)."""
         if not re.search(r'(^|\s|;|&&|\|\|)sudo\b', cmd):
             return cmd, cmd
         pw = self._get_sudo_password(remote)
         if pw is None:
-            return cmd, cmd  # fall through, let it fail
+            return cmd, cmd
         escaped_pw = pw.replace("'", "'\\''")
         wrapped = f"echo '{escaped_pw}' | sudo -S {cmd}"
         return wrapped, cmd
@@ -528,7 +741,6 @@ class LocalAgent:
         return f"Command: {cmd}\nExit Code: {rcode}\nOutput:\n{out}"
 
     def _is_path_escape(self, path: str) -> bool:
-        """Check if the given path resolves outside of self.cwd."""
         try:
             resolved = Path(self.cwd, Path(path).expanduser()).resolve()
             return not resolved.is_relative_to(Path(self.cwd).resolve())
@@ -538,14 +750,11 @@ class LocalAgent:
     def execute_edit(self, act: dict[str, Any]) -> str:
         path, rem, f_txt, r_txt = act["path"], act["remote"], act["find"], act["replace"]
 
-        # First try read with normal boundaries
         content, err = read_file(path, self.cwd, rem)
         if err == "path_escapes":
-            # Path is outside cwd — prompt for approval
             escape_path = Path(self.cwd, Path(path).expanduser()).resolve()
             print(f"\033[33m⚠ [Edit] Path escapes repo boundary: {escape_path}\033[0m")
 
-            # Try reading with allow_escape to show the diff
             content, err = read_file(path, self.cwd, rem, allow_escape=True)
             if err:
                 self.log_tool_call("edit", False, {"err": err}); return f"Error reading {path}: {err}"
@@ -600,7 +809,6 @@ class LocalAgent:
         if not (ok := check_syntax(path, content))[0]:
             self.log_tool_call("write", False, {"err": ok[1], "path": path}); return f"Syntax Error: {ok[1]}"
 
-        # Check if path escapes repo boundary
         if self._is_path_escape(path):
             escape_path = Path(self.cwd, Path(path).expanduser()).resolve()
             print(f"\033[33m⚠ [Write] Path escapes repo boundary: {escape_path}\033[0m")
@@ -646,8 +854,8 @@ class LocalAgent:
             p = "Summarize:\n" + "\n".join(f"[{m['role']}]\n{m['content']}" for m in self.messages[1:split_idx])
             if self._compaction_summary: p = f"Prev summary:\n{self._compaction_summary}\n\nNew:\n{p}"
             
-            if resp := self.llm_request([{"role": "system", "content": _SUMMARIZATION_SYSTEM_PROMPT}, {"role": "user", "content": p}]):
-                self._compaction_summary = resp["choices"][0]["message"].get("content", "")
+            if resp := self.llm_request([{"role": "system", "content": _SUMMARIZATION_SYSTEM_PROMPT}, {"role": "user", "content": p}], stream=False):
+                self._compaction_summary = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
                 self.messages = [self.messages[0], {"role": "assistant", "content": f"Memory Summary:\n{self._compaction_summary}"}] + self.messages[split_idx:]
 
     def run_agent_turn(self, req: str):
@@ -661,21 +869,19 @@ class LocalAgent:
 
         for _ in range(50):
             try:
-                if not (resp := self.llm_request(self.messages)): break
+                if not (resp := self.llm_request(self.messages, stream=True)): break
 
-                text = resp["choices"][0]["message"].get("content", "")
+                text = resp.get("content", "")
                 self.messages.append({"role": "assistant", "content": text}); self.log_message("assistant", text)
-
-                if reason := re.search(r'<think>([\s\S]*?)</think>', text) or resp["choices"][0]["message"].get("reasoning_content"):
-                    print(f"\033[3;90m{(reason.group(1) if isinstance(reason, re.Match) else reason).strip()}\033[0m\n")
-
-                if clean := re.sub(r'<think>[\s\S]*?</think>\n*', '', text).strip(): print(render_md(clean))
 
                 u, t = resp.get("usage", {}), resp.get("timings", {})
                 if u and t:
-                    print(f"\033[90mctx: {(u.get('prompt_tokens', 0) / CONTEXT_WINDOW) * 100:.1f}% | cache: {(t.get('cache_n', 0) / u.get('prompt_tokens', 1)) * 100:.0f}% | {t.get('predicted_per_second', 0):.1f} t/s\033[0m")
+                    print(f"\033[90mctx: {(u.get('prompt_tokens', 0) / CONTEXT_WINDOW) * 100:.1f}% | cache: {(t.get('cache_n', 0) / max(u.get('prompt_tokens', 1), 1)) * 100:.0f}% | {t.get('predicted_per_second', 0):.1f} t/s\033[0m")
+                elif u:
+                    print(f"\033[90mctx: {(u.get('prompt_tokens', 0) / CONTEXT_WINDOW) * 100:.1f}%\033[0m")
 
-                if not (actions := parse_xml_actions(text)): break
+                clean_text = re.sub(r'<think>[\s\S]*?</think>', '', text)
+                if not (actions := parse_xml_actions(clean_text)): break
                 print()
                 self.messages.append({"role": "user", "content": "### Action Results\n\n" + "\n\n---\n\n".join(
                     self.execute_shell(a) if a["type"] == "shell" else self.execute_edit(a) if a["type"] == "edit" else self.execute_write(a) for a in actions
@@ -686,7 +892,6 @@ class LocalAgent:
                 self.messages.pop()
                 self._write_log({"type": "event", "ts": time.time(), "event": "turn_interrupted"})
                 break
-
     def run_repl(self):
         global LLM_HOST
         tag = f"  \033[90m{ _model_tag() }\033[0m" if _model_tag() else ""
@@ -714,7 +919,7 @@ class LocalAgent:
                 cmd, _, arg = ui.partition(" ")
                 if cmd in ("/exit", "/quit"): break
                 elif cmd == "/help":
-                    print(f"{H2_COLOR}Available Commands:{RESET}\n  {BOLD}!cmd{RESET}       Run `cmd` locally and optionally add output to context\n  {BOLD}/sessions{RESET}  List recent conversation sessions\n  {BOLD}/load <id>{RESET} Load a previous session by its number or ID\n  {BOLD}/clear{RESET}     Clear conversation history (keeps system prompt)\n  {BOLD}/auto{RESET}      Toggle auto-execute mode\n  {BOLD}/host URL{RESET}  Change LLM host\n  {BOLD}/exit{RESET}      Quit the agent")
+                    print(f"{H2_COLOR}Available Commands:{RESET}\n  {BOLD}!cmd{RESET}       Run `cmd` locally and optionally add output to context\n  {BOLD}/sessions{RESET} List recent conversation sessions\n  {BOLD}/load <id>{RESET} Load a previous session by its number or ID\n  {BOLD}/clear{RESET}     Clear conversation history (keeps system prompt)\n  {BOLD}/auto{RESET}      Toggle auto-execute mode\n  {BOLD}/host URL{RESET}  Change LLM host\n  {BOLD}/exit{RESET}      Quit the agent")
                 elif cmd == "/sessions":
                     print(f"\033[36mRecent conversations:\033[0m")
                     for i, s in enumerate(self.list_sessions()[:10], 1):
@@ -793,7 +998,7 @@ def launch_in_docker(args_to_pass: list[str]):
     ip = resolve_target_ip(tgt_host)
     print(f"[*] Resolved '{tgt_host}' to {ip}")
 
-    net, proxy = "agent-sandbox", f"llm-proxy-{random.randint(10000, 99999)}"
+    net, proxy = "agent-sandbox", f"llm-proxy-{random.randint(1000, 9999)}"
     atexit.register(lambda: (subprocess.run(["docker", "rm", "-f", proxy], capture_output=True), subprocess.run(["docker", "network", "rm", net], capture_output=True)))
 
     print("[*] Setting up sandboxed environment...")
