@@ -149,6 +149,7 @@ H1_COLOR, H2_COLOR, H3_COLOR = "\033[1;4;38;5;213m", "\033[1;38;5;213m", "\033[1
 CODE_BG, XML_BG = "\033[48;5;236;38;5;253m", "\033[48;5;129;38;5;255m"
 QUOTE_COLOR, LIST_BULLET, TABLE_BORDER = "\033[38;5;245;3m", "\033[38;5;214m", "\033[38;5;239m"
 LINK_TEXT, LINK_URL = "\033[38;5;111;4m", "\033[38;5;240m"
+SHELL_OUTPUT_BG = "\033[48;5;235;90m"  # faint dark bg + dim gray text
 
 XML_SYSTEM_PROMPT = """You are an advanced AI agent. You control the host machine using precise XML tags. Do NOT use JSON-based tool calls.
 
@@ -347,9 +348,11 @@ def parse_xml_actions(text: str) -> list[dict[str, Any]]:
 # Markdown & Visuals
 # =========================================================================
 
+_MD_BLANK = object()
+
 def render_md(text: str) -> str:
     if not text.strip():
-        return ""
+        return _MD_BLANK
         
     w = shutil.get_terminal_size((80, 20)).columns
 
@@ -404,26 +407,38 @@ def render_md(text: str) -> str:
         return "\n".join(res)
 
     # 2. Handle standard single lines (Headers, Lists, Inline bold & code)
-    is_header = text.startswith("# ") or text.startswith("## ")
-    
-    if text.startswith("# "):
-        t = text[2:]
+    is_header = text.startswith("# ") or text.startswith("## ") or text.startswith("### ")
+
+    if text.startswith("### "):
+        t = text[4:]
     elif text.startswith("## "):
         t = text[3:]
+    elif text.startswith("# "):
+        t = text[2:]
     else:
         t = text
-    
-    base_color = f"{H1_COLOR}{BOLD}" if is_header else RESET
+
+    if is_header:
+        header_colors = {"# ": H1_COLOR, "## ": H2_COLOR, "### ": H3_COLOR}
+        prefix = ("## ", "# ") if text.startswith("### ") else ("#", "")
+        raw_prefix = text.split(" ")[0] + " "
+        base_color = f"{header_colors.get(raw_prefix, H1_COLOR)}{BOLD}"
+    else:
+        base_color = RESET
     
     t = re.sub(r'\*\*(.+?)\*\*', lambda m: f"{BOLD}{m.group(1)}{base_color}", t)
     t = re.sub(r'`([^`]+)`', lambda m: f"{INLINE_CODE_BG} {m.group(1)} \033[49m{base_color}", t)
 
     if is_header:
-        return f"\n{H1_COLOR}{BOLD}{t}{RESET}"
-    elif t.startswith("- ") or t.startswith("* "):
+        return f"{base_color}{t}{RESET}"
+    elif _is_md_list_item(t):
         return f"{LIST_BULLET}•{RESET} {t[2:]}"
     
     return t
+
+
+def _is_md_list_item(line: str) -> bool:
+    return line.startswith("- ") or line.startswith("* ")
 
 
 class Spinner:
@@ -535,20 +550,22 @@ class LocalAgent:
                     raw_buffer = ""
                     md_buffer = ""
 
+                    _prev_was = {"type": "other"}
+
                     def flush_md_buffer():
                         nonlocal md_buffer
                         while md_buffer:
                             s_stripped = md_buffer.lstrip(" \t\r\n")
                             if not s_stripped:
                                 break
-                                
+
                             block_found = False
                             is_buffering_xml = False
-                            
+
                             for tag in ["write", "edit", "shell"]:
                                 start_sig = f"<{tag}"
                                 end_sig = f"</{tag}>"
-                                
+
                                 if s_stripped.startswith(start_sig):
                                     end_idx = md_buffer.find(end_sig)
                                     if end_idx != -1:
@@ -558,31 +575,58 @@ class LocalAgent:
                                         rendered = render_md(block)
                                         if rendered:
                                             print(rendered)
+                                        _prev_was["type"] = "other"
                                         block_found = True
-                                        break 
+                                        break
                                     else:
                                         is_buffering_xml = True
                                         break
                                 elif start_sig.startswith(s_stripped):
                                     is_buffering_xml = True
                                     break
-                                    
+
                             if block_found:
                                 continue
-                                
+
                             if is_buffering_xml:
                                 return
-                                
+
                             if "\n" in md_buffer:
                                 line_end = md_buffer.find("\n")
                                 line = md_buffer[:line_end]
                                 md_buffer = md_buffer[line_end + 1:]
-                                
+
                                 rendered = render_md(line)
-                                if rendered:
-                                    print(rendered)
+
+                                if rendered is _MD_BLANK:
+                                    _prev_was["type"] = "blank"
+                                    continue
+
+                                if not rendered:
+                                    continue
+
+                                prev = _prev_was["type"]
+                                cur_is_header = line.startswith("# ") or line.startswith("## ") or line.startswith("### ")
+                                cur_is_list = _is_md_list_item(line.lstrip()) if not cur_is_header else False
+
+                                # Add spacing between sections
+                                if cur_is_header:
+                                    print()  # blank line before header
+                                elif prev in ("header", "blank") and not cur_is_list:
+                                    print()
+                                elif prev == "list" and not cur_is_list:
+                                    print()
+
+                                print(rendered)
+
+                                if cur_is_header:
+                                    _prev_was["type"] = "header"
+                                elif cur_is_list:
+                                    _prev_was["type"] = "list"
+                                else:
+                                    _prev_was["type"] = "other"
                                 continue
-                            
+
                             break 
                     
                     for line in r:
@@ -669,8 +713,16 @@ class LocalAgent:
                         print(RESET, end="", flush=True)
                         
                     if md_buffer.strip():
-                        rendered = render_md(md_buffer)
-                        if rendered:
+                        # flush any complete lines first
+                        flush_md_buffer()
+                        # render remaining partial line
+                        remaining = md_buffer.strip()
+                        rendered = render_md(remaining)
+                        if rendered is not _MD_BLANK and rendered:
+                            prev = _prev_was["type"]
+                            cur_is_header = remaining.startswith("# ") or remaining.startswith("## ") or remaining.startswith("### ")
+                            if cur_is_header or prev in ("header", "list", "blank"):
+                                print()
                             print(rendered)
                             
                     print()
@@ -690,7 +742,13 @@ class LocalAgent:
         lines = []
         try:
             for l in p.stdout:
-                print(f"\033[{color_code}{l.rstrip()}\033[0m" if color_code else l, end="" if not color_code else "\n")
+                if not color_code:
+                    print(l, end="")
+                elif color_code == "90m":
+                    w = shutil.get_terminal_size((80, 20)).columns
+                    print(f"{SHELL_OUTPUT_BG}{l.rstrip().ljust(w)}{CLEAR_LINE}{RESET}", end="\n")
+                else:
+                    print(f"\033[{color_code}{l.rstrip()}\033[0m", end="\n")
                 lines.append(l.rstrip('\n'))
             p.wait()
         except KeyboardInterrupt:
