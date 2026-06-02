@@ -426,7 +426,12 @@ def render_md(text: str) -> str:
     else:
         base_color = RESET
     
+    # Inline formatting — order matters! Bold before italic to avoid conflicts.
     t = re.sub(r'\*\*(.+?)\*\*', lambda m: f"{BOLD}{m.group(1)}{base_color}", t)
+    t = re.sub(r'(?<!\w)\*(.+?)\*(?!\w)', lambda m: f"{ITALIC}{m.group(1)}{base_color}", t)
+    t = re.sub(r'(?<!\w)_(.+?)_(?!\w)', lambda m: f"{ITALIC}{m.group(1)}{base_color}", t)
+    t = re.sub(r'~~(.+?)~~', lambda m: f"{STRIKE}{m.group(1)}{base_color}", t)
+    t = re.sub(r'\[(.+?)\]\((.+?)\)', lambda m: f"{LINK_TEXT}{m.group(1)}{RESET} {LINK_URL}({m.group(2)}){base_color}", t)
     t = re.sub(r'`([^`]+)`', lambda m: f"{INLINE_CODE_BG} {m.group(1)} \033[49m{base_color}", t)
 
     if is_header:
@@ -657,7 +662,7 @@ class LocalAgent:
                             
                             if reasoning:
                                 if not in_native_think:
-                                    print(THINK_COLOR, end="", flush=True)
+                                    print("\n" + THINK_COLOR + "> ", end="", flush=True)
                                     in_native_think = True
                                     full_text += "<think>\n"
                                 print(reasoning, end="", flush=True)
@@ -679,7 +684,7 @@ class LocalAgent:
                                             if before:
                                                 md_buffer += before
                                                 flush_md_buffer()
-                                            print(THINK_COLOR, end="", flush=True)
+                                            print("\n" + THINK_COLOR + "> ", end="", flush=True)
                                             in_simulated_think = True
                                             raw_buffer = after
                                         else:
