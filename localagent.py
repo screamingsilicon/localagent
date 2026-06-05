@@ -22,7 +22,8 @@ import time
 import unicodedata
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+
+from render_markdown import render_md, MD_BLANK, _is_md_list_item
 import urllib.request
 
 # =========================================================================
@@ -41,6 +42,8 @@ def parse_args():
     )
     parser.add_argument("-y", "--yolo", action="store_true", help="Enable auto-execute mode (skip y/n confirmations)")
     parser.add_argument("--sandbox", action="store_true", help="Launch the agent in an isolated Docker container")
+    parser.add_argument("--cpus", type=float, default=2.0, help="Limit CPU cores for sandbox (default: 2, e.g. 2 or 0.5)")
+    parser.add_argument("--memory", type=str, default='4g', help="Limit memory for sandbox (default: 4g, e.g. '4g', '512m')")
     parser.add_argument("--host", default=None, help="LLM host URL (overrides LLM_HOST env var)")
     parser.add_argument("--model", default=None, help="Model name (overrides LLM_MODEL env var)")
     parser.add_argument("--temperature", type=float, default=None, help="Temperature for LLM responses (overrides LLM_TEMPERATURE env var)")
@@ -242,7 +245,8 @@ def check_syntax(path: str, content: str) -> tuple[bool, str | None]:
     except SyntaxError as e: return False, str(e)
 
 def system_summary() -> dict[str, Any]:
-    sum_d = {"os": platform.system(), "release": platform.release(), "python": sys.version.split()[0], "cwd": os.getcwd(), "shell": os.environ.get("SHELL", ""), "user": os.environ.get("USER", os.environ.get("USERNAME", "unknown")), "cpu_cores": os.cpu_count() or 0}
+    cwd = "/workspace" if _ARGS.sandbox else os.getcwd()
+    sum_d = {"os": platform.system(), "release": platform.release(), "python": sys.version.split()[0], "cwd": cwd, "shell": os.environ.get("SHELL", ""), "user": os.environ.get("USER", os.environ.get("USERNAME", "unknown")), "cpu_cores": os.cpu_count() or 0}
     if platform.system() == "Linux":
         try: sum_d["memory_total_gb"] = round(os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / (1024**3), 1)
         except: pass
@@ -266,6 +270,24 @@ def read_file(path: str, base_dir: str, remote: str | None = None, allow_escape:
     if remote:
         p = subprocess.run(f"ssh {remote} \"cat '{path}'\"", shell=True, capture_output=True, text=True)
         return (p.stdout, None) if p.returncode == 0 else (None, p.stderr.strip())
+
+    if _ARGS.sandbox:
+        # Validate path doesn't escape workspace
+        try:
+            p = Path(base_dir, Path(path).expanduser()).resolve(strict=False)
+            base_resolved = Path(base_dir).resolve()
+            if not allow_escape and not p.is_relative_to(base_resolved): return None, "path_escapes"
+        except Exception:
+            pass
+        # Normalize path: resolve then make relative to /workspace to avoid double-prefix
+        resolved = Path(path).resolve(strict=False)
+        rel = os.path.relpath(resolved, "/workspace")
+        cpath = f"/workspace/{rel}"
+        content, err = _docker_exec_read_file(cpath)
+        if err: return None, "not found"
+        if not content: return "[empty]", None
+        return content, None
+
     try:
         p = Path(base_dir, Path(path).expanduser()).resolve(strict=False)
         base_resolved = Path(base_dir).resolve()
@@ -290,6 +312,23 @@ def write_file(path: str, content: str, base_dir: str, remote: str | None = None
             shell=True, input=content, text=True, capture_output=True,
         )
         return p.stderr.strip() if p.returncode != 0 else None
+
+    if _ARGS.sandbox:
+        try:
+            p = Path(base_dir, Path(path).expanduser()).resolve(strict=False)
+            base_resolved = Path(base_dir).resolve()
+            if not allow_escape and not p.is_relative_to(base_resolved): return "path_escapes"
+        except Exception:
+            pass
+        # Normalize path: resolve then make relative to /workspace to avoid double-prefix
+        resolved = Path(path).resolve(strict=False)
+        rel = os.path.relpath(resolved, "/workspace")
+        cpath = f"/workspace/{rel}"
+        # Ensure parent dir exists inside container
+        subprocess.run(["docker", "exec", "-i", _SANDBOX_CONTAINER, "sh", "-c", f"mkdir -p '{os.path.dirname(cpath)}'"], capture_output=True)
+        rc = _docker_exec_file_write(cpath, content)
+        return None if rc == 0 else "write failed"
+
     try:
         p = Path(base_dir, Path(path).expanduser()).resolve(strict=False)
         base_resolved = Path(base_dir).resolve()
@@ -344,108 +383,6 @@ def parse_xml_actions(text: str) -> list[dict[str, Any]]:
         actions.append(act)
     return actions
 
-# =========================================================================
-# Markdown & Visuals
-# =========================================================================
-
-_MD_BLANK = object()
-
-def render_md(text: str) -> str:
-    if not text.strip():
-        return _MD_BLANK
-        
-    w = shutil.get_terminal_size((80, 20)).columns
-
-    # 1. Intercept and parse fully buffered XML Tool Blocks
-    m = re.match(r'^\s*<(?P<tag>shell|edit|write)(?:[^>]*path="(?P<path>[^"]+)")?(?:[^>]*remote="(?P<remote>[^"]+)")?[^>]*>\n?(?P<inner>[\s\S]*?)\n?</\1>\s*$', text)
-    if m:
-        tag = m.group("tag")
-        path = m.group("path") or ""
-        remote = m.group("remote") or "local"
-        inner = m.group("inner").strip('\r\n')
-        
-        res = [""]
-        
-        if tag == "write":
-            header = f" [WRITE] {path} " + (f"({remote})" if remote != "local" else "")
-            h_bg = "\033[48;5;31m\033[38;5;255m"  
-            b_bg = "\033[48;5;236m\033[38;5;252m" 
-            
-            res.append(f"{h_bg}{BOLD}{header.ljust(w)}{CLEAR_LINE}{RESET}")
-            for l in inner.split('\n'):
-                res.append(f"{b_bg}  {l.ljust(w - 2)}{CLEAR_LINE}{RESET}")
-                
-        elif tag == "edit":
-            header = f" [EDIT] {path} " + (f"({remote})" if remote != "local" else "")
-            h_bg = "\033[48;5;96m\033[38;5;255m"  
-            b_bg = "\033[48;5;236m\033[38;5;252m"
-            
-            res.append(f"{h_bg}{BOLD}{header.ljust(w)}{CLEAR_LINE}{RESET}")
-            
-            f_m = re.search(r'<find>\n?([\s\S]*?)\n?</find>', inner)
-            r_m = re.search(r'<replace>\n?([\s\S]*?)\n?</replace>', inner)
-            
-            if f_m and r_m:
-                for l in f_m.group(1).strip('\r\n').split('\n'):
-                    res.append(f"{b_bg} \033[38;5;196m - {l.ljust(w - 4)}{CLEAR_LINE}{RESET}")
-                for l in r_m.group(1).strip('\r\n').split('\n'):
-                    res.append(f"{b_bg} \033[38;5;46m + {l.ljust(w - 4)}{CLEAR_LINE}{RESET}")
-            else:
-                for l in inner.split('\n'):
-                    res.append(f"{b_bg}  {l.ljust(w - 2)}{CLEAR_LINE}{RESET}")
-
-        elif tag == "shell":
-            header = f" [SHELL] {remote} " if remote != "local" else " [SHELL] "
-            h_bg = "\033[48;5;239m\033[38;5;255m"  
-            b_bg = "\033[48;5;235m\033[38;5;250m" 
-            
-            res.append(f"{h_bg}{BOLD}{header.ljust(w)}{CLEAR_LINE}{RESET}")
-            for l in inner.split('\n'):
-                res.append(f"{b_bg}  $ {l.ljust(w - 4)}{CLEAR_LINE}{RESET}")
-
-        res.append("")
-        return "\n".join(res)
-
-    # 2. Handle standard single lines (Headers, Lists, Inline bold & code)
-    is_header = text.startswith("# ") or text.startswith("## ") or text.startswith("### ")
-
-    if text.startswith("### "):
-        t = text[4:]
-    elif text.startswith("## "):
-        t = text[3:]
-    elif text.startswith("# "):
-        t = text[2:]
-    else:
-        t = text
-
-    if is_header:
-        header_colors = {"# ": H1_COLOR, "## ": H2_COLOR, "### ": H3_COLOR}
-        prefix = ("## ", "# ") if text.startswith("### ") else ("#", "")
-        raw_prefix = text.split(" ")[0] + " "
-        base_color = f"{header_colors.get(raw_prefix, H1_COLOR)}{BOLD}"
-    else:
-        base_color = RESET
-    
-    # Inline formatting — order matters! Bold before italic to avoid conflicts.
-    t = re.sub(r'\*\*(.+?)\*\*', lambda m: f"{BOLD}{m.group(1)}{base_color}", t)
-    t = re.sub(r'(?<!\w)\*(.+?)\*(?!\w)', lambda m: f"{ITALIC}{m.group(1)}{base_color}", t)
-    t = re.sub(r'(?<!\w)_(.+?)_(?!\w)', lambda m: f"{ITALIC}{m.group(1)}{base_color}", t)
-    t = re.sub(r'~~(.+?)~~', lambda m: f"{STRIKE}{m.group(1)}{base_color}", t)
-    t = re.sub(r'\[(.+?)\]\((.+?)\)', lambda m: f"{LINK_TEXT}{m.group(1)}{RESET} {LINK_URL}({m.group(2)}){base_color}", t)
-    t = re.sub(r'`([^`]+)`', lambda m: f"{INLINE_CODE_BG} {m.group(1)} \033[49m{base_color}", t)
-
-    if is_header:
-        return f"{base_color}{t}{RESET}"
-    elif _is_md_list_item(t):
-        return f"{LIST_BULLET}•{RESET} {t[2:]}"
-    
-    return t
-
-
-def _is_md_list_item(line: str) -> bool:
-    return line.startswith("- ") or line.startswith("* ")
-
-
 class Spinner:
     def __init__(self): self.stop_event = threading.Event()
     def start(self):
@@ -461,9 +398,10 @@ class Spinner:
 # =========================================================================
 
 class LocalAgent:
-    def __init__(self, auto_mode: bool = False):
+    def __init__(self, auto_mode: bool = False, sandbox: bool = False):
         self.auto_mode = auto_mode
-        self.cwd = os.getcwd()
+        self.sandbox = sandbox
+        self.cwd = "/workspace" if sandbox else os.getcwd()
         self.log_dir = Path.home() / ".localagent" / "logs" / Path(self.cwd).name
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.session_file = self.log_dir / f"session_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
@@ -603,7 +541,7 @@ class LocalAgent:
 
                                 rendered = render_md(line)
 
-                                if rendered is _MD_BLANK:
+                                if rendered is MD_BLANK:
                                     _prev_was["type"] = "blank"
                                     continue
 
@@ -723,7 +661,7 @@ class LocalAgent:
                         # render remaining partial line
                         remaining = md_buffer.strip()
                         rendered = render_md(remaining)
-                        if rendered is not _MD_BLANK and rendered:
+                        if rendered is not MD_BLANK and rendered:
                             prev = _prev_was["type"]
                             cur_is_header = remaining.startswith("# ") or remaining.startswith("## ") or remaining.startswith("### ")
                             if cur_is_header or prev in ("header", "list", "blank"):
@@ -743,6 +681,9 @@ class LocalAgent:
             return None
         
     def stream_command_output(self, exec_cmd: str, color_code: str = "90m") -> tuple[list[str], int]:
+        if self.sandbox:
+            return _docker_exec(exec_cmd)
+
         p = subprocess.Popen(exec_cmd, shell=True, executable="/bin/bash", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, cwd=self.cwd)
         lines = []
         try:
@@ -804,6 +745,8 @@ class LocalAgent:
         return f"Command: {cmd}\nExit Code: {rcode}\nOutput:\n{out}"
 
     def _is_path_escape(self, path: str) -> bool:
+        if self.sandbox:
+            return False  # No boundary checks inside sandbox — the container is the boundary
         try:
             resolved = Path(self.cwd, Path(path).expanduser()).resolve()
             return not resolved.is_relative_to(Path(self.cwd).resolve())
@@ -957,8 +900,19 @@ class LocalAgent:
                 break
     def run_repl(self):
         global LLM_HOST
-        tag = f"  \033[90m{ _model_tag() }\033[0m" if _model_tag() else ""
-        print(f"\033[36m{APP_NAME} @ {LLM_HOST}{tag}{f' \033[31m[YOLO: ON]\033[0m' if self.auto_mode else ''} (/help)\033[0m")
+        host = re.sub(r'^https?://', '', LLM_HOST)
+        model_tag = _model_tag() if _model_tag() else ""
+
+        parts = [f"\033[1;36m⚡ {APP_NAME}\033[0m"]
+        parts.append(f"\033[90m{host}\033[0m")
+        if self.sandbox:
+            parts.append(f"\033[33m[{_SANDBOX_CONTAINER}]\033[0m")
+        if model_tag:
+            parts.append(f"\033[90m│\033[0m \033[37m{model_tag}\033[0m")
+        if self.auto_mode:
+            parts.append(f"\033[1;31m[yolo]\033[0m")
+
+        print(" ".join(parts) + f"  \033[90m(/help)\033[0m")
         while True:
             set_terminal_title(f"❓ {APP_NAME}"); print(f"\n\033[32m❯ \033[0m", end="", flush=True)
             try: lines = [input()]
@@ -1019,17 +973,6 @@ class LocalAgent:
 # Docker Sandbox Orchestration
 # =========================================================================
 
-def _ensure_socat_proxy_image():
-    if subprocess.run(["docker", "image", "inspect", "socat-proxy"], capture_output=True).returncode == 0:
-        return
-    print("[*] Building socat-proxy image...")
-    subprocess.run(
-        ["docker", "build", "-t", "socat-proxy", "-"],
-        input="FROM alpine\nRUN apk add --no-cache socat\nENTRYPOINT [\"socat\"]\n",
-        text=True, check=True, capture_output=True,
-    )
-
-
 def ensure_docker_image():
     if subprocess.run(["docker", "image", "inspect", "localagent-image"], capture_output=True).returncode == 0: return
     print("[*] Docker image 'localagent-image' not found. Building it automatically...")
@@ -1040,48 +983,102 @@ def ensure_docker_image():
         print("[!] Error: Failed to build the Docker image. Ensure Docker is running.")
         sys.exit(1)
 
-def resolve_target_ip(hostname: str) -> str:
-    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", hostname): return hostname
-    try:
-        if (ip := socket.gethostbyname(hostname)) != "127.0.0.1": return ip
-    except: pass
-    print(f"[!] Error: Could not resolve IP for host '{hostname}'.\n[!] Ensure the host is accessible on your network.")
-    sys.exit(1)
+# Global sandbox state (set at runtime)
+_SANDBOX_CONTAINER = None
 
-def launch_in_docker(args_to_pass: list[str]):
+
+def setup_sandbox():
+    """Create persistent container with no network. Agent runs on host, tools exec inside."""
+    global _SANDBOX_CONTAINER
+
     ensure_docker_image()
-    _ensure_socat_proxy_image()
-    parsed = urlparse(os.environ.get("LLM_HOST", LLM_HOST))
-    tgt_host, tgt_port = parsed.hostname or "localhost", parsed.port or 8080
 
-    if tgt_host in ("localhost", "127.0.0.1"):
-        print(f"[!] Warning: LLM_HOST targets '{tgt_host}'. Inside Docker, use LAN/VPN IP instead.")
+    _SANDBOX_CONTAINER = f"agent-sandbox-{os.getpid()}-{int(time.time())}"
 
-    print(f"[*] Analyzing LLM_HOST: {parsed.geturl()}")
-    ip = resolve_target_ip(tgt_host)
-    print(f"[*] Resolved '{tgt_host}' to {ip}")
-
-    net, proxy = "agent-sandbox", f"llm-proxy-{random.randint(1000, 9999)}"
-    atexit.register(lambda: (subprocess.run(["docker", "rm", "-f", proxy], capture_output=True), subprocess.run(["docker", "network", "rm", net], capture_output=True)))
-
-    print("[*] Setting up sandboxed environment...")
-    subprocess.run(["docker", "network", "rm", net], capture_output=True)
-    subprocess.run(["docker", "network", "create", "--internal", net], check=True, capture_output=True)
-    subprocess.run(["docker", "run", "-d", "--rm", "--name", proxy, "--network", "bridge", "socat-proxy", f"TCP-LISTEN:{tgt_port},fork,reuseaddr", f"TCP:{ip}:{tgt_port}"], check=True, capture_output=True)
-    subprocess.run(["docker", "network", "connect", net, proxy], check=True, capture_output=True)
-
-    c_host = f"{parsed.scheme or 'http'}://{proxy}:{tgt_port}{parsed.path}" + (f"?{parsed.query}" if parsed.query else "")
+    # Build docker run command with optional resource limits
     cmd = [
-        "docker", "run", "--rm", "-it", "--network", net, "--cap-drop=ALL", "--read-only", "--tmpfs", "/tmp",
-        "-u", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp", "-v", f"{os.getcwd()}:/workspace:rw",
-        "-v", f"{os.path.abspath(__file__)}:/app/localagent.py:ro", "-w", "/workspace", "-e", f"LLM_HOST={c_host}",
-        "localagent-image", "python", "/app/localagent.py"
-    ] + args_to_pass
+        "docker", "run", "-d", "--name", _SANDBOX_CONTAINER,
+        "--network", "none",
+        "--cap-drop=ALL", "--read-only", "--tmpfs", "/tmp:exec",
+        "-u", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp",
+        "-v", f"{os.getcwd()}:/workspace:rw", "-w", "/workspace",
+    ]
+    if _ARGS.cpus is not None:
+        cmd.extend(["--cpus", str(_ARGS.cpus)])
+    if _ARGS.memory is not None:
+        cmd.extend(["--memory", _ARGS.memory])
+    cmd.extend(["localagent-image", "tail", "-f", "/dev/null"])
+    subprocess.run(cmd, check=True, capture_output=True)
 
-    print(f"[*] Launching agent. Internal LLM_HOST mapped to {c_host}\n")
-    try: subprocess.run(cmd)
-    except KeyboardInterrupt: pass
-    sys.exit(0)
+    atexit.register(_teardown_sandbox)
+
+
+def _teardown_sandbox():
+    if _SANDBOX_CONTAINER:
+        subprocess.run(["docker", "rm", "-f", _SANDBOX_CONTAINER], capture_output=True)
+
+
+def _docker_exec(cmd: str, cwd: str | None = None) -> tuple[list[str], int]:
+    """Execute a command inside the sandbox container, streaming output."""
+    docker_cmd = ["docker", "exec", "-i", _SANDBOX_CONTAINER, "sh", "-c", cmd]
+    p = subprocess.Popen(
+        docker_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1
+    )
+    lines = []
+    try:
+        for line in p.stdout:
+            lines.append(line.rstrip('\n'))
+            # Mirror output styling from stream_command_output
+            w = shutil.get_terminal_size((80, 20)).columns
+            print(f"{SHELL_OUTPUT_BG}{line.rstrip().ljust(w)}{CLEAR_LINE}{RESET}", end="\n")
+        p.wait()
+    except KeyboardInterrupt:
+        p.terminate()
+        try: p.wait(timeout=2)
+        except: p.kill()
+        lines.append("[Interrupted]")
+    return lines, p.returncode
+
+
+def _docker_exec_file_write(path: str, content: str) -> int:
+    """Write file content inside sandbox via stdin pipe."""
+    p = subprocess.run(
+        ["docker", "exec", "-i", _SANDBOX_CONTAINER, "sh", "-c", f"cat > '{path}'"],
+        input=content, text=True, capture_output=True
+    )
+    return p.returncode
+
+
+def _docker_exec_file_edit(path: str, find: str, replace: str) -> tuple[bool, str]:
+    """Perform find/replace edit inside sandbox container."""
+    script = f"""
+python3 -c "
+import sys
+path = '{path}'
+with open(path) as f: content = f.read()
+if '{find.replace("'", "\\'")}' not in content:
+    print('ERROR: text not found', file=sys.stderr); sys.exit(1)
+content = content.replace('{find.replace("'", "\\'")}', '{replace.replace("'", "\\'")}', 1)
+with open(path, 'w') as f: f.write(content)
+"
+"""
+    p = subprocess.run(
+        ["docker", "exec", "-i", _SANDBOX_CONTAINER, "bash", "-c", script],
+        capture_output=True, text=True
+    )
+    return p.returncode == 0, p.stderr.strip()
+
+
+def _docker_exec_read_file(path: str) -> tuple[str | None, str | None]:
+    """Read file content from inside sandbox container."""
+    p = subprocess.run(
+        ["docker", "exec", _SANDBOX_CONTAINER, "cat", path],
+        capture_output=True, text=True
+    )
+    if p.returncode != 0:
+        return None, p.stderr.strip()
+    return p.stdout, None
 
 # =========================================================================
 # Main Execution
@@ -1089,12 +1086,10 @@ def launch_in_docker(args_to_pass: list[str]):
 
 if __name__ == "__main__":
     if _ARGS.sandbox:
-        f_args = sys.argv[1:]
-        if "--sandbox" in f_args: f_args.remove("--sandbox")
-        launch_in_docker(f_args)
+        setup_sandbox()
+
+    agent = LocalAgent(auto_mode=AUTO_MODE, sandbox=_ARGS.sandbox)
+    if _ARGS.task:
+        agent.run_agent_turn(_ARGS.task)
     else:
-        agent = LocalAgent(auto_mode=AUTO_MODE)
-        if _ARGS.task:
-            agent.run_agent_turn(_ARGS.task)
-        else:
-            agent.run_repl()
+        agent.run_repl()
