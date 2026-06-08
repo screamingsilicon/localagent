@@ -1,3 +1,7 @@
+"""Python syntax highlighter using the stdlib tokenizer."""
+
+from __future__ import annotations
+
 import io
 import re
 import tokenize
@@ -5,7 +9,6 @@ import keyword
 
 
 C = {
-    # Original bash2.py colours
     "keyword":    "\033[1;92m",   # Bold Bright Green – keywords
     "flag":       "\033[36m",     # Cyan              – builtins, comments, decorators
     "op":         "\033[1;35m",   # Bold Magenta      – operators (+, ==, etc.)
@@ -15,7 +18,6 @@ C = {
     "number":     "\033[1;96m",   # Bold Cyan         – numbers / literals
     "arg":        "\033[0m",      # Reset / default   – plain identifiers
 
-    # New entries (derived from the same base palette)
     "docstring":  "\033[2;33m",   # Dim Yellow        – docstrings
     "magic":      "\033[1;94m",   # Bold Bright Blue  – magic methods (__init__)
     "special":    "\033[36m",     # Cyan              – self / cls params
@@ -39,7 +41,6 @@ BUILTINS = {
     "input", "open", "super", "property", "staticmethod", "classmethod",
     "format", "vars", "dir", "help", "exec", "eval", "compile",
     "breakpoint", "memoryview", "bytearray", "bytes",
-    # exceptions (common ones)
     "Exception", "ValueError", "TypeError", "KeyError", "IndexError",
     "AttributeError", "ImportError", "FileNotFoundError", "RuntimeError",
     "StopIteration", "NotImplementedError", "OverflowError",
@@ -107,7 +108,6 @@ def _colorize_single(tok_type, tok_string, ctx: _Ctx):
     """Return (colored_text,) for a single token."""
     t = tokenize.tok_name.get(tok_type, "")
 
-    # ── Whitespace / newlines ────────────────────────────────────────
     if t in ("NEWLINE", "INDENT", "DEDENT", "NL", "ENCODING"):
         # Reset annotation context on newline — annotations don't span lines
         ctx.in_annotation = False
@@ -118,7 +118,6 @@ def _colorize_single(tok_type, tok_string, ctx: _Ctx):
     if t == "ENDMARKER":
         return ""
 
-    # ── f-string support (Python 3.12+ splits into multiple tokens) ─
     if t == "FSTRING_START":
         ctx.in_fstring_literal = True
         return C["string"] + tok_string + C["reset"]
@@ -131,21 +130,15 @@ def _colorize_single(tok_type, tok_string, ctx: _Ctx):
         # Literal text inside f-string — color as string
         return C["string"] + tok_string + C["reset"]
 
-    # ── Strings (including docstrings) ───────────────────────────────
     if t == "STRING":
-        # Check if it's a docstring — caller passes tokens + idx
-        # We handle this in the main loop; here just color as string
         return C["string"] + tok_string + C["reset"]
 
-    # ── Numbers ──────────────────────────────────────────────────────
     if t == "NUMBER":
         return C["number"] + tok_string + C["reset"]
 
-    # ── Comments ─────────────────────────────────────────────────────
     if t == "COMMENT":
         return C["flag"] + tok_string + C["reset"]
 
-    # ── Operators & punctuation ──────────────────────────────────────
     if t == "OP":
         # Track paren depth for annotation scoping
         if tok_string in ("(", "[", "{"):
@@ -182,7 +175,6 @@ def _colorize_single(tok_type, tok_string, ctx: _Ctx):
             if ctx.annotation_depth <= 0:
                 ctx.in_annotation = False
         elif tok_string == "(":
-            # Opening paren after def keyword — entering param list
             pass
         elif tok_string == "=":
             # Default value / assignment — end annotation for this param
@@ -208,7 +200,6 @@ def _colorize_single(tok_type, tok_string, ctx: _Ctx):
             return C["punct"] + tok_string + C["reset"]
         return C["op"] + tok_string + C["reset"]
 
-    # ── NAME tokens ──────────────────────────────────────────────────
     if t == "NAME":
         # Magic methods: __init__, __str__, etc.
         if tok_string.startswith("__") and tok_string.endswith("__") and len(tok_string) > 4:
@@ -300,7 +291,6 @@ def _highlight_tokens(source: str, tokens: list, show_trailing: bool = False) ->
                 ctx.var_before_colon = None
             continue
 
-        # ── Determine colored text ───────────────────────────────────
         is_docstring = (t_name == "STRING" and _is_docstring(tok_type, tok_string, tokens, global_idx))
         is_fstring_literal = t_name in ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END")
 
@@ -325,7 +315,6 @@ def _highlight_tokens(source: str, tokens: list, show_trailing: bool = False) ->
             if is_dangerous:
                 colored_raw = C["danger"] + tok_string + C["reset"]
 
-        # ── Split by newlines for multiline tokens ───────────────────
         start_row, start_col = tok.start
         end_row, end_col = tok.end
 
@@ -346,7 +335,7 @@ def _highlight_tokens(source: str, tokens: list, show_trailing: bool = False) ->
 
                 # End offset: just before the \n (so the \n is in the gap)
                 if ri < len(raw_lines) - 1:
-                    eoff = line_start[cur_row] - 1  # exclude the \n
+                    eoff = line_start[cur_row] - 1
                 else:
                     eoff = line_start[end_row - 1] + end_col
 
@@ -363,7 +352,6 @@ def _highlight_tokens(source: str, tokens: list, show_trailing: bool = False) ->
         elif t_name == "OP":
             ctx.prev_op = tok_string
 
-    # ── Merge segments into final output ─────────────────────────────
     segs.sort(key=lambda s: s[0])
     result_parts: list[str] = []
     prev_off = 0
@@ -398,7 +386,6 @@ def _visualize_trailing_in_gap(text: str) -> str:
     For single-line gaps (no \\n), visualize trailing whitespace normally.
     """
     if "\n" in text:
-        # Multi-line gap: only first line can have trailing ws
         parts = text.split("\n", 1)
         first_line = parts[0]
         stripped = first_line.rstrip()
@@ -409,7 +396,6 @@ def _visualize_trailing_in_gap(text: str) -> str:
             parts[0] = stripped + C["trailing"] + vis + C["reset"]
         return "\n".join(parts)
     else:
-        # Single-line gap (e.g. tail after last token on a line)
         stripped = text.rstrip()
         trailing = text[len(stripped):]
         if trailing:
@@ -438,3 +424,19 @@ def diff_highlight(old_source: str, new_source: str,
         old_label=old_label, new_label=new_label,
         context_lines=context_lines,
     )
+
+
+if __name__ == "__main__":
+    import sys
+
+    show_trailing = "--trailing" in sys.argv
+    if show_trailing:
+        sys.argv.remove("--trailing")
+
+    if len(sys.argv) > 1:
+        with open(sys.argv[1]) as f:
+            src = f.read()
+    else:
+        src = sys.stdin.read()
+
+    sys.stdout.write(highlight(src, show_trailing=show_trailing))

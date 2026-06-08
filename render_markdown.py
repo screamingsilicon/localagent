@@ -16,12 +16,10 @@ from __future__ import annotations
 import re
 import shutil
 
-# -- Sentinel -----------------------------------------------------------
 _MD_BLANK = object()  # returned for blank / whitespace-only input
 MD_BLANK = _MD_BLANK   # public alias — use `is MD_BLANK` in callers
 
 
-# -- ANSI colour palette (self-contained) -------------------------------
 _RESET       = "\033[0m"
 _BOLD        = "\033[1m"
 _ITALIC      = "\033[3m"
@@ -37,15 +35,12 @@ _LIST_BULLET    = "\033[38;5;214m"   # peach bullet
 _LINK_TEXT      = "\033[38;5;111;4m"  # cyan + underline
 _LINK_URL       = "\033[38;5;240m"   # dim gray
 
-# Hard-coded palette used inside XML tool-block banners:
 _BG_WRITE_HDR  = "\033[48;5;31m\033[38;5;255m"   # red bg, white fg
 _BG_EDIT_HDR   = "\033[48;5;96m\033[38;5;255m"  # teal bg, white fg
 _BG_SHELL_HDR  = "\033[48;5;239m\033[38;5;255m" # gray bg, white fg
 _BG_BODY       = "\033[48;5;236m\033[38;5;252m" # dark body bg, light text
 _BG_SHELL_BODY = "\033[48;5;235m\033[38;5;250m" # shell body: darker + dim
 
-
-# -- Display width for wide/emoji characters ----------------------------
 
 def _char_display_width(ch: str) -> int:
     """Return the terminal column width for a single character.
@@ -97,14 +92,10 @@ def _drjust(s: str, width: int) -> str:
     return " " * pad + s
 
 
-# -- Helpers ------------------------------------------------------------
-
 def _is_md_list_item(line: str) -> bool:
     """Return True if *line* is a markdown unordered list item."""
     return line.startswith("- ") or line.startswith("* ")
 
-
-# -- Main renderer ------------------------------------------------------
 
 def render_md(text: str):
     """Render one or more lines of markdown to ANSI-coloured terminal text.
@@ -123,7 +114,6 @@ def render_md(text: str):
 
     w = shutil.get_terminal_size((80, 20)).columns
 
-    # -- 1. XML Tool Blocks (fully buffered) --------------------------
     m = re.match(
         r'^\s*<(?P<tag>shell|edit|write)'
         r'(?:[^>]*path="(?P<path>[^"]+)")?'
@@ -139,14 +129,12 @@ def render_md(text: str):
 
         res: list[str] = [""]
 
-        # -- [write] block --
         if tag == "write":
             header = f" [WRITE] {path} " + (f"({remote})" if remote != "local" else "")
             res.append(f"{_BG_WRITE_HDR}{_BOLD}{header.ljust(w)}{_CLEAR_LINE}{_RESET}")
             for line in inner.split("\n"):
                 res.append(f"{_BG_BODY}  {line.ljust(w - 2)}{_CLEAR_LINE}{_RESET}")
 
-        # -- [edit] block --
         elif tag == "edit":
             header = f" [EDIT] {path} " + (f"({remote})" if remote != "local" else "")
             res.append(f"{_BG_EDIT_HDR}{_BOLD}{header.ljust(w)}{_CLEAR_LINE}{_RESET}")
@@ -163,7 +151,6 @@ def render_md(text: str):
                 for line in inner.split("\n"):
                     res.append(f"{_BG_BODY}  {line.ljust(w - 2)}{_CLEAR_LINE}{_RESET}")
 
-        # -- [shell] block --
         elif tag == "shell":
             header = f" [SHELL] {remote} " if remote != "local" else " [SHELL] "
             res.append(f"{_BG_SHELL_HDR}{_BOLD}{header.ljust(w)}{_CLEAR_LINE}{_RESET}")
@@ -173,7 +160,6 @@ def render_md(text: str):
         res.append("")
         return "\n".join(res)
 
-    # -- 2a. Markdown tables -----------------------------------------
     _TABLE_RE = re.compile(r"^\|(.+)\|\s*$")
 
     def _is_table_block(t: str) -> bool:
@@ -247,7 +233,7 @@ def render_md(text: str):
         t_top = "\u252C"   # T-top (header-sep junction)
         t_bot = "\u2534"   # T-bottom (body-sep junction)
 
-        PAD = 1  # spaces of padding on each side of a cell
+        PAD = 1
 
         def _fmt_cell(cell: str, width: int, align: str) -> str:
             if align == "left":
@@ -265,10 +251,8 @@ def render_md(text: str):
 
         res: list[str] = []
 
-        # Top border
         res.append(tl + h_seg(eff_widths) + tr)
 
-        # Header row
         header_fmt = v.join(
             _fmt_cell(c, w, a) for c, w, a in zip(header_cells, col_widths, aligns)
         )
@@ -277,7 +261,6 @@ def render_md(text: str):
         # Separator line (T-top junctions)
         res.append(tl + h_seg(eff_widths) + tr)
 
-        # Body rows
         for row in body_rows:
             row_fmt = v.join(
                 _fmt_cell(c, cw, a) for c, cw, a in zip(row, col_widths, aligns)
@@ -291,7 +274,6 @@ def render_md(text: str):
     if _is_table_block(text):
         return _render_table(text)
 
-    # -- 2b. Standard markdown lines (headers, lists, inline fmt) ----
     is_header = text.startswith("# ") or text.startswith("## ") or text.startswith("### ")
 
     if text.startswith("### "):
@@ -330,11 +312,8 @@ def render_md(text: str):
     return t
 
 
-# -- Standalone demo / smoke-test ---------------------------------------
-
 def _print_with_spacing(rendered, prev_type: str) -> str:
     """Mimic the spacing logic from localagent.py streaming loop."""
-    line = rendered  # not needed; we derive type from input
     cur_is_header = rendered.startswith(("\033[1;4;", "\033[1;38;5;"))
     cur_is_list = rendered.startswith(_LIST_BULLET)
 

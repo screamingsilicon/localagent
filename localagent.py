@@ -12,7 +12,6 @@ import platform
 import random
 import re
 import shutil
-import socket
 import stat
 import subprocess
 import sys
@@ -26,9 +25,7 @@ from typing import Any
 from render_markdown import render_md, MD_BLANK, _is_md_list_item
 import urllib.request
 
-# =========================================================================
-# CLI Argument Parsing
-# =========================================================================
+
 
 CLI_VERSION = 5
 
@@ -52,9 +49,6 @@ def parse_args():
     parser.add_argument("task", nargs="?", default=None, help="One-shot task: run it and exit")
     return parser.parse_args()
 
-# =========================================================================
-# Constants, Theme & UI Configuration
-# =========================================================================
 
 _ARGS = parse_args()
 AUTO_MODE = _ARGS.yolo
@@ -64,7 +58,7 @@ MODEL = _ARGS.model or os.getenv("LLM_MODEL", "local-model")
 TEMPERATURE = _ARGS.temperature if _ARGS.temperature is not None else float(os.getenv("LLM_TEMPERATURE", "0.7"))
 HTTP_REQUEST_TIMEOUT = 600
 
-# --- Dynamic context sizing ---
+
 _COMPRESS_PCT      = 0.50
 _SUMMARIZE_PCT     = 0.70
 _TURN_PREFIX_PCT   = 0.20
@@ -218,9 +212,6 @@ Format exactly as follows:
 ## 7. Next Steps
 """
 
-# =========================================================================
-# Utilities & Heuristics
-# =========================================================================
 
 def format_relative_time(ts: float) -> str:
     diff = time.time() - ts
@@ -262,9 +253,6 @@ def set_terminal_title(t: str) -> None:
     print(f"\033]0;{t}\007", end="", flush=True)
     if _TMUX_WINDOW_ID: run_command(f"tmux rename-window -t {_TMUX_WINDOW_ID} {t!r} 2>/dev/null")
 
-# =========================================================================
-# Filesystem & IO Wrappers
-# =========================================================================
 
 def read_file(path: str, base_dir: str, remote: str | None = None, allow_escape: bool = False) -> tuple[str | None, str | None]:
     if remote:
@@ -272,14 +260,12 @@ def read_file(path: str, base_dir: str, remote: str | None = None, allow_escape:
         return (p.stdout, None) if p.returncode == 0 else (None, p.stderr.strip())
 
     if _ARGS.sandbox:
-        # Validate path doesn't escape workspace
         try:
             p = Path(base_dir, Path(path).expanduser()).resolve(strict=False)
             base_resolved = Path(base_dir).resolve()
             if not allow_escape and not p.is_relative_to(base_resolved): return None, "path_escapes"
         except Exception:
             pass
-        # Normalize path: resolve then make relative to /workspace to avoid double-prefix
         resolved = Path(path).resolve(strict=False)
         rel = os.path.relpath(resolved, "/workspace")
         cpath = f"/workspace/{rel}"
@@ -320,11 +306,9 @@ def write_file(path: str, content: str, base_dir: str, remote: str | None = None
             if not allow_escape and not p.is_relative_to(base_resolved): return "path_escapes"
         except Exception:
             pass
-        # Normalize path: resolve then make relative to /workspace to avoid double-prefix
         resolved = Path(path).resolve(strict=False)
         rel = os.path.relpath(resolved, "/workspace")
         cpath = f"/workspace/{rel}"
-        # Ensure parent dir exists inside container
         subprocess.run(["docker", "exec", "-i", _SANDBOX_CONTAINER, "sh", "-c", f"mkdir -p '{os.path.dirname(cpath)}'"], capture_output=True)
         rc = _docker_exec_file_write(cpath, content)
         return None if rc == 0 else "write failed"
@@ -338,9 +322,6 @@ def write_file(path: str, content: str, base_dir: str, remote: str | None = None
         return None
     except Exception as e: return str(e)
 
-# =========================================================================
-# Text & XML Parsing
-# =========================================================================
 
 def normalize_text(text: str, strict: bool = False) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -369,18 +350,44 @@ def format_diff(old_str: str, new_str: str, ctx: int = 1) -> str:
 
 def parse_xml_actions(text: str) -> list[dict[str, Any]]:
     actions = []
-    pattern = r'<(?P<tag>shell|edit|write)(?:[^>]*path="(?P<path>[^"]+)")?(?:[^>]*remote="(?P<remote>[^"]+)")?[^>]*>(?P<inner>[\s\S]*?)</\1>'
+    
+    # (?m) enables multiline mode (^ and $ match start/end of lines)
+    # Branch 1: <shell> allows inline or multiline anywhere.
+    # Branch 2: <edit> and <write> STRICTLY require opening and closing tags to be at the start of a line.
+    pattern = (
+        r'(?m)'
+        r'<(shell)\b([^>]*)>([\s\S]*?)</\1>|'
+        r'^[ \t]*<(edit|write)\b(?=[^>]*\bpath="[^"]+")([^>]*)>\n([\s\S]*?)\n^[ \t]*</\4>'
+    )
+    
     for m in re.finditer(pattern, text):
-        tag, inner = m.group("tag"), m.group("inner")
-        act = {"type": tag, "remote": m.group("remote"), "path": m.group("path") or ""}
-        if tag == "shell": act["command"] = inner.strip()
-        elif tag == "write": act["content"] = inner.strip()
+        if m.group(1):
+            tag, attrs, inner = m.group(1), m.group(2), m.group(3)
+        else:
+            tag, attrs, inner = m.group(4), m.group(5), m.group(6)
+            
+        path_m = re.search(r'\bpath="([^"]+)"', attrs)
+        remote_m = re.search(r'\bremote="([^"]+)"', attrs)
+        
+        act = {
+            "type": tag,
+            "remote": remote_m.group(1) if remote_m else None,
+            "path": path_m.group(1) if path_m else ""
+        }
+        
+        if tag == "shell":
+            act["command"] = inner.strip()
+        elif tag == "write":
+            act["content"] = inner.strip()
         elif tag == "edit":
-            find_m = re.search(r'<find>([\s\S]*?)</find>', inner)
-            rep_m = re.search(r'<replace>([\s\S]*?)</replace>', inner)
+            # Also strictly anchor <find> and <replace> to avoid nested collisions
+            find_m = re.search(r'(?m)^[ \t]*<find>\n([\s\S]*?)\n^[ \t]*</find>', inner)
+            rep_m = re.search(r'(?m)^[ \t]*<replace>\n([\s\S]*?)\n^[ \t]*</replace>', inner)
             act["find"] = find_m.group(1).strip('\n') if find_m else ""
             act["replace"] = rep_m.group(1).strip('\n') if rep_m else ""
+            
         actions.append(act)
+        
     return actions
 
 class Spinner:
@@ -393,9 +400,6 @@ class Spinner:
         threading.Thread(target=spin, daemon=True).start()
     def stop(self): self.stop_event.set(); print(f"\r{CLEAR_LINE}", end="", flush=True)
 
-# =========================================================================
-# Core Agent & Operations
-# =========================================================================
 
 class LocalAgent:
     def __init__(self, auto_mode: bool = False, sandbox: bool = False):
@@ -552,9 +556,8 @@ class LocalAgent:
                                 cur_is_header = line.startswith("# ") or line.startswith("## ") or line.startswith("### ")
                                 cur_is_list = _is_md_list_item(line.lstrip()) if not cur_is_header else False
 
-                                # Add spacing between sections
                                 if cur_is_header:
-                                    print()  # blank line before header
+                                    print()
                                 elif prev in ("header", "blank") and not cur_is_list:
                                     print()
                                 elif prev == "list" and not cur_is_list:
@@ -583,8 +586,7 @@ class LocalAgent:
                                 chunk = json.loads(line[6:])
                             except json.JSONDecodeError:
                                 continue
-                            
-                            # Grab both usage and timings
+
                             if "usage" in chunk and chunk["usage"]:
                                 usage_data = chunk["usage"]
                             if "timings" in chunk and chunk["timings"]:
@@ -656,9 +658,7 @@ class LocalAgent:
                         print(RESET, end="", flush=True)
                         
                     if md_buffer.strip():
-                        # flush any complete lines first
                         flush_md_buffer()
-                        # render remaining partial line
                         remaining = md_buffer.strip()
                         rendered = render_md(remaining)
                         if rendered is not MD_BLANK and rendered:
@@ -669,7 +669,6 @@ class LocalAgent:
                             print(rendered)
                             
                     print()
-                    # Return timings alongside usage
                     return {"content": full_text, "usage": usage_data, "timings": timing_data}
                     
         except KeyboardInterrupt:
@@ -969,9 +968,6 @@ class LocalAgent:
                 except KeyboardInterrupt: print(f"\n\033[33m⚠ Turn interrupted (Ctrl+C). Session preserved. Type a new request or /exit.\033[0m")
         print("\nGoodbye!"); set_terminal_title("")
 
-# =========================================================================
-# Docker Sandbox Orchestration
-# =========================================================================
 
 def ensure_docker_image():
     if subprocess.run(["docker", "image", "inspect", "localagent-image"], capture_output=True).returncode == 0: return
@@ -983,7 +979,7 @@ def ensure_docker_image():
         print("[!] Error: Failed to build the Docker image. Ensure Docker is running.")
         sys.exit(1)
 
-# Global sandbox state (set at runtime)
+
 _SANDBOX_CONTAINER = None
 
 
@@ -995,7 +991,6 @@ def setup_sandbox():
 
     _SANDBOX_CONTAINER = f"agent-sandbox-{os.getpid()}-{int(time.time())}"
 
-    # Build docker run command with optional resource limits
     cmd = [
         "docker", "run", "-d", "--name", _SANDBOX_CONTAINER,
         "--network", "none",
@@ -1029,7 +1024,6 @@ def _docker_exec(cmd: str, cwd: str | None = None) -> tuple[list[str], int]:
     try:
         for line in p.stdout:
             lines.append(line.rstrip('\n'))
-            # Mirror output styling from stream_command_output
             w = shutil.get_terminal_size((80, 20)).columns
             print(f"{SHELL_OUTPUT_BG}{line.rstrip().ljust(w)}{CLEAR_LINE}{RESET}", end="\n")
         p.wait()
@@ -1050,24 +1044,7 @@ def _docker_exec_file_write(path: str, content: str) -> int:
     return p.returncode
 
 
-def _docker_exec_file_edit(path: str, find: str, replace: str) -> tuple[bool, str]:
-    """Perform find/replace edit inside sandbox container."""
-    script = f"""
-python3 -c "
-import sys
-path = '{path}'
-with open(path) as f: content = f.read()
-if '{find.replace("'", "\\'")}' not in content:
-    print('ERROR: text not found', file=sys.stderr); sys.exit(1)
-content = content.replace('{find.replace("'", "\\'")}', '{replace.replace("'", "\\'")}', 1)
-with open(path, 'w') as f: f.write(content)
-"
-"""
-    p = subprocess.run(
-        ["docker", "exec", "-i", _SANDBOX_CONTAINER, "bash", "-c", script],
-        capture_output=True, text=True
-    )
-    return p.returncode == 0, p.stderr.strip()
+
 
 
 def _docker_exec_read_file(path: str) -> tuple[str | None, str | None]:
@@ -1080,9 +1057,6 @@ def _docker_exec_read_file(path: str) -> tuple[str | None, str | None]:
         return None, p.stderr.strip()
     return p.stdout, None
 
-# =========================================================================
-# Main Execution
-# =========================================================================
 
 if __name__ == "__main__":
     if _ARGS.sandbox:
