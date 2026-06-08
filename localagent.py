@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from render_markdown import render_md, MD_BLANK, _is_md_list_item
+from highlighters import highlight_bash
 import urllib.request
 
 
@@ -331,22 +332,70 @@ def normalize_text(text: str, strict: bool = False) -> str:
         text = re.sub(pat, rep, text)
     return text
 
-def find_and_replace(content: str, old_text: str, new_text: str, path: str, strict: bool = False) -> tuple[str, str]:
+def find_and_replace(content: str, old_text: str, new_text: str, path: str, strict: bool = False) -> tuple[str, str, int, int]:
+    """Returns (old_content, new_content, start_line, end_line) using 1-based line numbers."""
     if not old_text: raise ValueError("oldText empty")
     if (exact_idx := content.find(old_text)) != -1:
         if content.count(old_text) > 1: raise ValueError("Multiple exact matches found.")
-        return content, content[:exact_idx] + new_text + content[exact_idx + len(old_text):]
+        start_line = content[:exact_idx].count('\n') + 1
+        end_line = content[exact_idx:exact_idx + len(old_text)].count('\n') + start_line
+        return content, content[:exact_idx] + new_text + content[exact_idx + len(old_text):], start_line, end_line
 
     if strict:
         raise ValueError(f"Text not found in {path}. Provide an exact match (including whitespace/indentation).")
     base, norm_old = normalize_text(content), normalize_text(old_text)
     if (norm_idx := base.find(norm_old)) == -1: raise ValueError(f"Text not found in {path}. Check whitespace/indentation.")
     if base.count(norm_old) > 1: raise ValueError("Multiple fuzzy matches found.")
-    return base, base[:norm_idx] + new_text + base[norm_idx + len(norm_old):]
+    start_line = base[:norm_idx].count('\n') + 1
+    end_line = base[norm_idx:norm_idx + len(norm_old)].count('\n') + start_line
+    return base, base[:norm_idx] + new_text + base[norm_idx + len(norm_old):], start_line, end_line
 
 def format_diff(old_str: str, new_str: str, ctx: int = 1) -> str:
     diff = difflib.unified_diff(old_str.splitlines(), new_str.splitlines(), n=ctx, lineterm="")
     return "\n".join(f" {RESET} ..." if l.startswith("@@") else l for l in diff if not l.startswith(("---", "+++")))
+
+
+def _get_highlighter(path: str):
+    """Return a highlight function based on file extension, or None."""
+    ext = os.path.splitext(path)[1].lower()
+    lang_map = {
+        ".py": "python",
+        ".pyi": "python",
+        ".sh": "bash",
+        ".bash": "bash",
+        ".html": "html",
+        ".htm": "html",
+    }
+    lang = lang_map.get(ext)
+    if not lang:
+        return None
+    try:
+        from highlighters import get_highlighter
+        hl_fn, _ = get_highlighter(lang)
+        return hl_fn
+    except (KeyError, ImportError):
+        return None
+
+
+def _print_highlighted_content(content: str, path: str, prefix: str = "+", max_lines: int = 10) -> None:
+    """Print file content with syntax highlighting if available, or plain green fallback."""
+    hl_fn = _get_highlighter(path)
+    lines = content.splitlines()
+
+    if hl_fn is not None:
+        highlighted = hl_fn(content)
+        for i, line in enumerate(highlighted.splitlines()):
+            if max_lines and i >= max_lines:
+                break
+            print(f"\033[32m{prefix}{RESET}{line}\033[0m")
+    else:
+        for i, line in enumerate(lines):
+            if max_lines and i >= max_lines:
+                break
+            print(f"\033[32m{prefix}{line}\033[0m")
+
+    if max_lines and len(lines) > max_lines:
+        print(f"\033[90m... ({len(lines) - max_lines} more lines)\033[0m")
 
 def parse_xml_actions(text: str) -> list[dict[str, Any]]:
     actions = []
@@ -716,7 +765,10 @@ class LocalAgent:
     def execute_shell(self, act: dict[str, Any]) -> str:
         cmd, remote = act["command"], act["remote"]
         safe = is_safe_read_command(cmd) and not remote
-        print(f"\033[{'90m' if safe else '36m'}{f'[{remote}] ' if remote else ''}$ {cmd}\033[0m")
+        highlighted_cmd = highlight_bash(cmd)
+        prefix_color = "90m" if safe else "36m"
+        remote_prefix = f"[{remote}] " if remote else ""
+        print(f"\033[{prefix_color}$ {remote_prefix}\033[0m{highlighted_cmd}")
         
         if not safe and not self.auto_mode:
             print(f"{BOLD}(y/n): {RESET}", end="", flush=True)
@@ -765,7 +817,7 @@ class LocalAgent:
                 self.log_tool_call("edit", False, {"err": err}); return f"Error reading {path}: {err}"
 
             try:
-                base, new = find_and_replace(normalize_text(content if content != "[empty]" else "", strict=True), f_txt, r_txt, path, strict=bool(rem))
+                base, new, start_line, end_line = find_and_replace(normalize_text(content if content != "[empty]" else "", strict=True), f_txt, r_txt, path, strict=bool(rem))
                 if not (ok := check_syntax(path, new))[0]:
                     self.log_tool_call("edit", False, {"err": ok[1]}); return f"Syntax Error: {ok[1]}"
 
@@ -784,6 +836,9 @@ class LocalAgent:
 
                 if err := write_file(path, new, self.cwd, rem, allow_escape=True):
                     self.log_tool_call("edit", False, {"err": err}); return f"Write failed: {err}"
+                n_removed = sum(1 for l in diff.splitlines() if l.startswith("-"))
+                n_added   = sum(1 for l in diff.splitlines() if l.startswith("+"))
+                print(f"\033[36m[Edit] {rem or 'local'} -> {path}: lines {start_line}-{end_line} | replaced {n_removed} lines with {n_added} lines\033[0m")
             except Exception as e:
                 self.log_tool_call("edit", False, {"err": str(e)}); return f"Edit failed: {e}"
 
@@ -792,13 +847,14 @@ class LocalAgent:
 
         else:
             try:
-                base, new = find_and_replace(normalize_text(content if content != "[empty]" else "", strict=True), f_txt, r_txt, path, strict=bool(rem))
+                base, new, start_line, end_line = find_and_replace(normalize_text(content if content != "[empty]" else "", strict=True), f_txt, r_txt, path, strict=bool(rem))
                 if not (ok := check_syntax(path, new))[0]:
                     self.log_tool_call("edit", False, {"err": ok[1]}); return f"Syntax Error: {ok[1]}"
 
                 diff = format_diff(base, new)
-                print(f"\033[36m[Edit] {rem or 'local'} -> {path}\033[0m")
-                for l in diff.splitlines(): print(f"\033[{'32m' if l.startswith('+') else '31m' if l.startswith('-') else '90m'}{l}\033[0m")
+                n_removed = sum(1 for l in diff.splitlines() if l.startswith("-"))
+                n_added   = sum(1 for l in diff.splitlines() if l.startswith("+"))
+                print(f"\033[36m[Edit] {rem or 'local'} -> {path}: lines {start_line}-{end_line} | replaced {n_removed} lines with {n_added} lines\033[0m")
 
                 if err := write_file(path, new, self.cwd, rem):
                     self.log_tool_call("edit", False, {"err": err}); return f"Write failed: {err}"
@@ -806,7 +862,9 @@ class LocalAgent:
                 self.log_tool_call("edit", False, {"err": str(e)}); return f"Edit failed: {e}"
 
         self.log_tool_call("edit", True, {"path": path})
-        return f"Successfully edited {path}\n\nDiff:\n{diff}"
+        n_removed = sum(1 for l in diff.splitlines() if l.startswith("-"))
+        n_added   = sum(1 for l in diff.splitlines() if l.startswith("+"))
+        return f"Successfully edited {path}: lines {start_line}-{end_line} | replaced {n_removed} lines with {n_added} lines"
 
     def execute_write(self, act: dict[str, Any]) -> str:
         path, rem, content = act["path"], act["remote"], act["content"]
@@ -814,12 +872,13 @@ class LocalAgent:
         if not (ok := check_syntax(path, content))[0]:
             self.log_tool_call("write", False, {"err": ok[1], "path": path}); return f"Syntax Error: {ok[1]}"
 
+        n_lines = len(content.splitlines())
+
         if self._is_path_escape(path):
             escape_path = Path(self.cwd, Path(path).expanduser()).resolve()
             print(f"\033[33m⚠ [Write] Path escapes repo boundary: {escape_path}\033[0m")
-            print(f"\033[36mProposed file content ({len(content.splitlines())} lines):\033[0m")
-            for l in content.splitlines()[:10]: print(f"\033[32m+{l}\033[0m")
-            if len(content.splitlines()) > 10: print(f"\033[32m... ({len(content.splitlines()) - 10} more lines)\033[0m")
+            print(f"\033[36mProposed file content ({n_lines} lines):\033[0m")
+            _print_highlighted_content(content, path, prefix="+", max_lines=10)
 
             if not self.auto_mode:
                 print(f"{BOLD}(Approve? y/n): {RESET}", end="", flush=True)
@@ -832,13 +891,13 @@ class LocalAgent:
 
             if err := write_file(path, content, self.cwd, rem, allow_escape=True):
                 self.log_tool_call("write", False, {"err": err}); return f"Write failed: {err}"
+
+            print(f"\033[36m[Write] Wrote {n_lines} lines to {path}\033[0m")
         else:
             if err := write_file(path, content, self.cwd, rem):
                 self.log_tool_call("write", False, {"err": err}); return f"Write failed: {err}"
 
-            print(f"\033[36m[Write] {rem or 'local'} -> {path}\033[0m")
-            for l in content.splitlines()[:10]: print(f"\033[32m+{l}\033[0m")
-            if len(content.splitlines()) > 10: print(f"\033[32m... ({len(content.splitlines())} lines written)\033[0m")
+            print(f"\033[36m[Write] Wrote {n_lines} lines to {path}\033[0m")
 
         self.log_tool_call("write", True, {"path": path})
         return f"Wrote content to {path}"

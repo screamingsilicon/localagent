@@ -150,7 +150,7 @@ def _diff_highlight(
     context_lines: int = 3,
 ) -> str:
     """Produce a syntax-highlighted unified diff between two Bash sources."""
-    from differ import diff_highlight as _raw_diff
+    from .differ import diff_highlight as _raw_diff
 
     old_colored = _highlight(old_source)
     new_colored = _highlight(new_source)

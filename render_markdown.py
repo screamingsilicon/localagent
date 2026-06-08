@@ -13,8 +13,56 @@ Usage:
 
 from __future__ import annotations
 
+import difflib
 import re
 import shutil
+import os
+
+from highlighters import highlight_bash
+
+
+def _get_diff_highlighter(path: str):
+    """Return a diff_highlight function based on file extension, or None."""
+    ext = os.path.splitext(path)[1].lower()
+    lang_map = {
+        ".py": "python",
+        ".pyi": "python",
+        ".sh": "bash",
+        ".bash": "bash",
+        ".html": "html",
+        ".htm": "html",
+    }
+    lang = lang_map.get(ext)
+    if not lang:
+        return None
+    try:
+        from highlighters import get_highlighter
+        _, diff_fn = get_highlighter(lang)
+        return diff_fn
+    except (KeyError, ImportError):
+        return None
+
+
+def _get_highlighter(path: str):
+    """Return a highlight function based on file extension, or None."""
+    ext = os.path.splitext(path)[1].lower()
+    lang_map = {
+        ".py": "python",
+        ".pyi": "python",
+        ".sh": "bash",
+        ".bash": "bash",
+        ".html": "html",
+        ".htm": "html",
+    }
+    lang = lang_map.get(ext)
+    if not lang:
+        return None
+    try:
+        from highlighters import get_highlighter
+        hl_fn, _ = get_highlighter(lang)
+        return hl_fn
+    except (KeyError, ImportError):
+        return None
 
 _MD_BLANK = object()  # returned for blank / whitespace-only input
 MD_BLANK = _MD_BLANK   # public alias — use `is MD_BLANK` in callers
@@ -25,6 +73,21 @@ _BOLD        = "\033[1m"
 _ITALIC      = "\033[3m"
 _STRIKE      = "\033[9m"
 _CLEAR_LINE  = "\033[K"
+
+_RE_ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+def _visible_len(s: str) -> int:
+    """Return length of string excluding ANSI escape sequences."""
+    return len(_RE_ANSI.sub("", s))
+
+
+def _pad_to(text: str, width: int) -> str:
+    """Pad text with spaces to reach *width* visible characters (accounts for ANSI codes)."""
+    needed = width - _visible_len(text)
+    if needed > 0:
+        return text + " " * needed
+    return text
 
 _H1_COLOR    = "\033[1;4;38;5;213m"   # bold + underline, peach
 _H2_COLOR    = "\033[1;38;5;213m"    # bold, peach
@@ -40,6 +103,11 @@ _BG_EDIT_HDR   = "\033[48;5;96m\033[38;5;255m"  # teal bg, white fg
 _BG_SHELL_HDR  = "\033[48;5;239m\033[38;5;255m" # gray bg, white fg
 _BG_BODY       = "\033[48;5;236m\033[38;5;252m" # dark body bg, light text
 _BG_SHELL_BODY = "\033[48;5;235m\033[38;5;250m" # shell body: darker + dim
+
+# Diff-specific backgrounds (inspired by differ.py)
+_DIFF_ADD_BG   = "\033[48;5;22m"    # dark green bg for added lines
+_DIFF_DEL_BG   = "\033[48;5;52m"    # dark red bg for removed lines
+_DIFF_CTX_BG   = "\033[48;5;236m"   # dark gray bg for context / headers
 
 
 def _char_display_width(ch: str) -> int:
@@ -132,8 +200,15 @@ def render_md(text: str):
         if tag == "write":
             header = f" [WRITE] {path} " + (f"({remote})" if remote != "local" else "")
             res.append(f"{_BG_WRITE_HDR}{_BOLD}{header.ljust(w)}{_CLEAR_LINE}{_RESET}")
-            for line in inner.split("\n"):
-                res.append(f"{_BG_BODY}  {line.ljust(w - 2)}{_CLEAR_LINE}{_RESET}")
+
+            hl_fn = _get_highlighter(path)
+            if hl_fn is not None:
+                highlighted = hl_fn(inner)
+                for line in highlighted.split("\n"):
+                    res.append(f"{_BG_BODY}  {line.ljust(w - 2)}{_CLEAR_LINE}{_RESET}")
+            else:
+                for line in inner.split("\n"):
+                    res.append(f"{_BG_BODY}  {line.ljust(w - 2)}{_CLEAR_LINE}{_RESET}")
 
         elif tag == "edit":
             header = f" [EDIT] {path} " + (f"({remote})" if remote != "local" else "")
@@ -143,10 +218,51 @@ def render_md(text: str):
             r_m = re.search(r"<replace>\n?([\s\S]*?)\n?</replace>", inner)
 
             if f_m and r_m:
-                for line in f_m.group(1).strip("\r\n").split("\n"):
-                    res.append(f"{_BG_BODY} \033[38;5;196m - {line.ljust(w - 4)}{_CLEAR_LINE}{_RESET}")
-                for line in r_m.group(1).strip("\r\n").split("\n"):
-                    res.append(f"{_BG_BODY} \033[38;5;46m + {line.ljust(w - 4)}{_CLEAR_LINE}{_RESET}")
+                old_text = f_m.group(1).strip("\r\n")
+                new_text = r_m.group(1).strip("\r\n")
+
+                # Try syntax-highlighted diff first
+                diff_fn = _get_diff_highlighter(path)
+                if diff_fn is not None:
+                    ctx = min(3, max(1, len(old_text.splitlines()) // 4),
+                              max(1, len(new_text.splitlines()) // 4))
+                    highlighted = diff_fn(old_text, new_text, old_label=path, new_label=path, context_lines=ctx)
+                    for line in highlighted.splitlines():
+                        # Skip --- / +++ headers (we already have [EDIT] header)
+                        if line.lstrip().startswith(("\033[", "")) and (
+                            "---" in line or "+++" in line):
+                            continue
+                        res.append(f" {line}{_CLEAR_LINE}")
+                else:
+                    # Fall back to differ.py's plain diff (no syntax highlighting)
+                    ctx = min(3, max(1, len(old_text.splitlines()) // 4),
+                              max(1, len(new_text.splitlines()) // 4))
+                    try:
+                        from highlighters.differ import plain_diff
+                        highlighted = plain_diff(old_text, new_text, old_label=path, new_label=path, context_lines=ctx)
+                        for line in highlighted.splitlines():
+                            # Strip ANSI codes to check for ---/+++ headers
+                            plain = re.sub(r'\033\[[\d;]*m', '', line).strip()
+                            if plain.startswith(("--- ", "+++ ")):
+                                continue  # skip file headers — we have [EDIT] already
+                            res.append(f" {line}{_CLEAR_LINE}")
+                    except ImportError:
+                        # differ.py unavailable — bare difflib fallback
+                        old_lines = old_text.split("\n")
+                        new_lines = new_text.split("\n")
+                        ctx2 = min(2, max(0, len(old_lines) // 3), max(0, len(new_lines) // 3))
+                        for line in difflib.unified_diff(old_lines, new_lines, n=ctx2, lineterm=""):
+                            if line.startswith(("---", "+++")):
+                                continue
+                            if line.startswith("+"):
+                                res.append(f"{_DIFF_ADD_BG} \033[1;32m+\033[39m{line[1:].ljust(w - 3)}{_CLEAR_LINE}{_RESET}")
+                            elif line.startswith("-"):
+                                res.append(f"{_DIFF_DEL_BG} \033[1;31m-\033[39m{line[1:].ljust(w - 3)}{_CLEAR_LINE}{_RESET}")
+                            elif line.startswith("@@"):
+                                res.append(f"{_DIFF_CTX_BG} \033[2;38;5;245m{line.ljust(w - 2)}{_CLEAR_LINE}{_RESET}")
+                            else:
+                                content = line[1:] if line and line[0] == " " else line
+                                res.append(f"{_DIFF_CTX_BG} \033[38;5;245m {content.ljust(w - 4)}{_CLEAR_LINE}{_RESET}")
             else:
                 for line in inner.split("\n"):
                     res.append(f"{_BG_BODY}  {line.ljust(w - 2)}{_CLEAR_LINE}{_RESET}")
@@ -154,8 +270,9 @@ def render_md(text: str):
         elif tag == "shell":
             header = f" [SHELL] {remote} " if remote != "local" else " [SHELL] "
             res.append(f"{_BG_SHELL_HDR}{_BOLD}{header.ljust(w)}{_CLEAR_LINE}{_RESET}")
-            for line in inner.split("\n"):
-                res.append(f"{_BG_SHELL_BODY}  $ {line.ljust(w - 4)}{_CLEAR_LINE}{_RESET}")
+            highlighted = highlight_bash(inner)
+            for line in highlighted.split("\n"):
+                res.append(f"{_BG_SHELL_BODY}  $ {_pad_to(line, w - 4)}{_CLEAR_LINE}{_RESET}")
 
         res.append("")
         return "\n".join(res)

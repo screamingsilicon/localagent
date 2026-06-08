@@ -413,7 +413,7 @@ def diff_highlight(old_source: str, new_source: str,
     Highlights both sources in full first, then delegates to the generic
     differ module for background-tinted diff output.
     """
-    from differ import diff_highlight as _raw_diff
+    from .differ import diff_highlight as _raw_diff
 
     old_colored = highlight(old_source)
     new_colored = highlight(new_source)

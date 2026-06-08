@@ -408,7 +408,7 @@ def diff_highlight(
     context_lines: int = 3,
 ) -> str:
     """Produce a syntax-highlighted unified diff between two HTML sources."""
-    from differ import diff_highlight as _raw_diff
+    from .differ import diff_highlight as _raw_diff
 
     old_colored = highlight(old_source)
     new_colored = highlight(new_source)
