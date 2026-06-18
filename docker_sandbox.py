@@ -119,12 +119,14 @@ def docker_exec(cmd: str, cwd: Optional[str] = None) -> Tuple[list[str], int]:
         docker_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
+        text=False,
         bufsize=1,
     )
     lines: list[str] = []
     try:
-        for line in p.stdout:
+        for raw_line in p.stdout:
+            # Decode with 'replace' to handle binary/non-UTF-8 output gracefully
+            line = raw_line.decode("utf-8", errors="replace")
             lines.append(line.rstrip("\n"))
             w = shutil.get_terminal_size((80, 20)).columns
             print(
@@ -174,8 +176,8 @@ def docker_exec_read_file(path: str) -> Tuple[Optional[str], Optional[str]]:
     p = subprocess.run(
         ["docker", "exec", _SANDBOX_CONTAINER, "cat", path],
         capture_output=True,
-        text=True,
+        text=False,
     )
     if p.returncode != 0:
-        return None, p.stderr.strip()
-    return p.stdout, None
+        return None, p.stderr.decode("utf-8", errors="replace").strip()
+    return p.stdout.decode("utf-8", errors="replace"), None
