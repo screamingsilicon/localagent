@@ -37,6 +37,13 @@ class SessionManager:
         m = meta or {}
         self._write_log({"type": "tool", "ts": time.time(), "tool": tool, "success": success, **m})
 
+    def log_event(self, event: str, extra: dict = None):
+        """Log a non-message event (e.g. turn_interrupted, compaction)."""
+        rec = {"type": "event", "ts": time.time(), "event": event}
+        if extra:
+            rec.update(extra)
+        self._write_log(rec)
+
     def list_sessions(self) -> list[dict[str, Any]]:
         sessions = []
         for p in sorted(self.log_dir.glob("*.jsonl"), reverse=True):

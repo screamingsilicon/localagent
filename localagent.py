@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
+import logging
 import os
-import re
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -22,58 +22,90 @@ from context_manager import compress_context
 
 APP_NAME = "localagent"
 
+_log = logging.getLogger(APP_NAME)
 
-def _run_in_container(cmd: str) -> str:
-    """Run a command inside the sandbox container and return stdout."""
+
+def _run_in_container(cmd: str, timeout: int = 10) -> str:
+    """Run a command inside the sandbox container and return stdout.
+
+    Logs a warning on any failure instead of silently returning "".
+    """
     import subprocess
     container = docker_sandbox.get_container_name()
     if not container:
+        _log.warning("No container name available for _run_in_container")
         return ""
     try:
         result = subprocess.run(
             ["docker", "exec", "-i", container, "sh", "-c", cmd],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=timeout,
         )
         return result.stdout.strip()
-    except Exception:
+    except subprocess.TimeoutExpired:
+        _log.warning("docker exec timed out (%ds): %s", timeout, cmd[:80])
+        return ""
+    except Exception as exc:
+        _log.warning("docker exec failed for '%s': %s", cmd[:80], exc)
         return ""
 
 
 def _container_system_info() -> dict[str, Any]:
-    """Collect system info from inside the sandbox container."""
+    """Collect system info from inside the sandbox container in one batch call."""
+    SEP = "|||"  # Non-whitespace delimiter safe for .strip()
+    probe = (
+        f'set -euo pipefail\n'
+        f'echo "{SEP}$(uname -r 2>/dev/null || echo unknown)"\n'
+        f'echo "{SEP}$(python3 --version 2>&1 || echo unknown)"\n'
+        'echo "' + SEP + '${SHELL:-/bin/sh}"\n'
+        f'echo "{SEP}$(id -un 2>/dev/null || id -u 2>/dev/null || echo unknown)"\n'
+        f'echo "{SEP}$(nproc 2>/dev/null || echo 0)"\n'
+        f'echo "{SEP}$(head -1 /proc/meminfo 2>/dev/null || true)"\n'
+        f'echo "{SEP}$(which git node npm jq rg fd sqlite3 cmake patch diff 2>/dev/null || true)"\n'
+    )
+    raw = _run_in_container(probe, timeout=5)
+    if not raw:
+        _log.warning("Container system info probe returned empty output")
+        return {"os": "Linux (Docker sandbox)", "release": "unknown", "python": "unknown",
+                "cwd": "/workspace", "shell": "/bin/sh", "user": "unknown", "cpu_cores": 0}
+
+    parts = raw.split(SEP)
+    # parts[0] is empty due to leading separator
+    release = (parts[1].strip() if len(parts) > 1 else "unknown")
+    python_ver = (parts[2].strip() if len(parts) > 2 else "unknown")
+    shell = (parts[3].strip() if len(parts) > 3 else "/bin/sh") or "/bin/sh"
+    user = (parts[4].strip() if len(parts) > 4 else "unknown")
+    cores_str = (parts[5].strip() if len(parts) > 5 else "0")
+    mem_line = (parts[6].strip() if len(parts) > 6 else "")
+    tools_raw = (parts[7].strip() if len(parts) > 7 else "")
+
+    cpu_cores = int(cores_str) if cores_str.isdigit() else 0
+
     info: dict[str, Any] = {
         "os": "Linux (Docker sandbox)",
-        "release": _run_in_container("uname -r"),
-        "python": _run_in_container("python3 --version 2>&1") or "unknown",
+        "release": release,
+        "python": python_ver or "unknown",
         "cwd": "/workspace",
-        "shell": _run_in_container("echo $SHELL") or "/bin/sh",
-        "user": _run_in_container("id -un") or f"uid-{_run_in_container('id -u')}",
-        "cpu_cores": 0,
+        "shell": shell,
+        "user": user,
+        "cpu_cores": cpu_cores,
     }
 
-    # CPU cores
-    cores = _run_in_container("nproc")
-    if cores.isdigit():
-        info["cpu_cores"] = int(cores)
-
-    # Memory
-    mem = _run_in_container("cat /proc/meminfo | head -1")
-    if mem:
+    # Parse memory
+    if mem_line:
         try:
-            parts = mem.split()
-            kb = int(parts[1])
+            m_parts = mem_line.split()
+            kb = int(m_parts[1])
             info["memory_total_gb"] = round(kb / (1024 * 1024), 1)
         except Exception:
             pass
 
-    # Installed tools the agent might want to know about
-    tools = ["git", "node", "npm", "jq", "rg", "fd", "sqlite3", "cmake", "patch", "diff"]
-    available = []
-    for tool in tools:
-        if _run_in_container(f"which {tool}") and True:
-            available.append(tool)
-    if available:
-        info["available_tools"] = available
+    # Parse available tools
+    known_tools = {"git", "node", "npm", "jq", "rg", "fd", "sqlite3", "cmake", "patch", "diff"}
+    if tools_raw:
+        found = {t.split("/")[-1] for t in tools_raw.splitlines() if t.strip()}
+        available = sorted(known_tools & found)
+        if available:
+            info["available_tools"] = available
 
     return info
 
@@ -85,13 +117,16 @@ def system_summary() -> dict[str, Any]:
     environment instead of reporting host information.
     """
     import platform
-    import sys
+    import sys as _sys
 
     if _Config.sandbox():
-        # Import here to avoid circular imports at module level
-        global docker_sandbox
-        import docker_sandbox  # noqa: PLC0415
-        return _container_system_info()
+        try:
+            global docker_sandbox  # noqa: PLW0603
+            if "docker_sandbox" not in globals() or docker_sandbox is None:
+                import docker_sandbox  # noqa: F821, PLC0415
+            return _container_system_info()
+        except ImportError as exc:
+            _log.warning("Cannot import docker_sandbox for system_summary: %s", exc)
 
     cwd = os.getcwd()
     sum_d = {
@@ -177,6 +212,26 @@ class LocalAgent:
             self.messages, self._compaction_summary, config=_Config, llm_request_fn=self.llm_request
         )
 
+    # -- Context guards -------------------------------------------------------
+
+    def _estimate_tokens(self) -> int:
+        """Rough token estimate for the current message list."""
+        return sum(len(str(m.get("content", ""))) // 4 for m in self.messages)
+
+    def _ensure_context_fits(self):
+        """Force-compress if context is dangerously close to the window limit."""
+        ctx_window = _Config.context_window()
+        if self._estimate_tokens() > int(ctx_window * 0.92):
+            _log.warning("Context near overflow (%d / %d tokens), force-compacting",
+                         self._estimate_tokens(), ctx_window)
+            self.compress_context()
+
+    def _maybe_compress_context(self):
+        """Compress only when context exceeds the configured threshold."""
+        ctx_window = _Config.context_window()
+        if self._estimate_tokens() > int(ctx_window * 0.65):
+            self.compress_context()
+
     # -- Main agent loop ------------------------------------------------------
 
     def run_agent_turn(self, req: str):
@@ -197,8 +252,19 @@ class LocalAgent:
         max_nudges = 3
         consecutive_no_action = 0
 
-        for _ in range(50):
+        # Turn-level timeout guard (10 minutes)
+        turn_start = time.monotonic()
+        TURN_TIMEOUT = 600
+
+        for iteration in range(50):
+            if time.monotonic() - turn_start > TURN_TIMEOUT:
+                print("\n\033[33m⚠ Turn timed out after 10 minutes. Moving on.\033[0m")
+                break
+
             try:
+                # Context window overflow protection
+                self._ensure_context_fits()
+
                 if not (resp := self.llm_request(self.messages, stream=True)):
                     break
 
@@ -212,11 +278,10 @@ class LocalAgent:
                 elif u:
                     print(f"\033[90mctx: {(u.get('prompt_tokens', 0) / _Config.context_window()) * 100:.1f}%\033[0m")
 
-                clean_text = re.sub(r'', '', text)
-                actions = parse_xml_actions(clean_text)
+                actions = parse_xml_actions(text)
 
                 if not actions:
-                    if "<done" in clean_text or "<done/>" in clean_text:
+                    if "<done" in text or "<done/>" in text:
                         break
 
                     consecutive_no_action += 1
@@ -239,13 +304,14 @@ class LocalAgent:
                         results.append(self.execute_write_action(a))
 
                 self.messages.append({"role": "user", "content": "### Action Results\n\n" + "\n\n---\n\n".join(results)})
-                self.compress_context()
+                # Only compact when context is getting large
+                self._maybe_compress_context()
 
             except KeyboardInterrupt:
                 print(f"\n\033[33m⚠ Turn interrupted (Ctrl+C). Session preserved. Type a new request or /exit.\033[0m")
                 if self.messages and self.messages[-1].get("role") == "user":
                     self.messages.pop()
-                self._session_mgr._write_log({"type": "event", "ts": time.time(), "event": "turn_interrupted"})
+                self._session_mgr.log_event("turn_interrupted")
                 break
 
     # -- REPL entry point -----------------------------------------------------
