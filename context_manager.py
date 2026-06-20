@@ -2,6 +2,13 @@ from __future__ import annotations
 
 import re
 
+from token_counter import count_tokens
+
+
+def _estimate_content(content: str) -> int:
+    """Estimate tokens for a single message's content."""
+    return count_tokens(str(content))
+
 
 def _extract_file_paths(content: str) -> tuple[list[str], list[str]]:
     """Extract file paths from action results and assistant messages."""
@@ -77,12 +84,12 @@ def compress_context(
         # Estimate trailing tokens (messages after the last usage report)
         trailing = 0
         for i in range((last_usage_idx or -1) + 1, len(messages)):
-            trailing += len(str(messages[i].get("content", ""))) // 4
+            trailing += _estimate_content(messages[i].get("content", ""))
 
         return last_usage_tokens + trailing if last_usage_idx is not None else _char_estimate(messages)
 
     def _char_estimate(messages: list[dict]) -> int:
-        return sum(len(str(m.get("content", ""))) // 4 for m in messages)
+        return sum(_estimate_content(m.get("content", "")) for m in messages)
 
     total_tokens = _estimate_from_usage(messages)
 
@@ -109,7 +116,7 @@ def compress_context(
         # Find split point — keep recent context within turn_prefix budget
         acc, split_idx = 0, 1
         for i in range(len(messages) - 1, -1, -1):
-            acc += len(str(messages[i].get("content", ""))) // 4
+            acc += _estimate_content(messages[i].get("content", ""))
             if acc > cfg.turn_prefix_tokens():
                 split_idx = max(1, i)
                 break

@@ -15,6 +15,10 @@ from pathlib import Path
 SHELL_MAX_LINES = 1000           # max lines to include in tool result
 SHELL_MAX_BYTES = 64 * 1024      # max bytes (~64KB) to include in tool result
 
+# Burst detection: if lines arrive within this gap (ms), treat as data dump
+# and suppress live output. Gaps larger than this indicate progress/status.
+BURST_GAP_MS = 200
+
 
 def truncate_output(
     raw_text: str,
@@ -120,17 +124,40 @@ def is_safe_read_command(cmd: str) -> bool:
     return True
 
 
+def _print_line(l: str, color_code: str):
+    """Print a single line with the given color styling."""
+    from display import SHELL_OUTPUT_BG, CLEAR_LINE, RESET
+
+    if not color_code:
+        print(l, end="")
+    elif color_code == "90m":
+        w = shutil.get_terminal_size((80, 20)).columns
+        print(f"{SHELL_OUTPUT_BG}{l.rstrip().ljust(w)}{CLEAR_LINE}{RESET}", end="\n")
+    else:
+        print(f"\033[{color_code}{l.rstrip()}\033[0m", end="\n")
+
+
 def stream_command_output(exec_cmd: str, color_code: str = "90m", cwd: str = None, sandbox: bool = False, timeout: int = 60) -> tuple[list[str], int]:
-    """Stream command output to terminal with optional coloring and timeout."""
+    """Stream command output to terminal with optional coloring and timeout.
+
+    Uses timing-based burst detection: if lines arrive within BURST_GAP_MS of
+    each other, output is treated as a data dump (cat, grep, ls) and buffered
+    silently. If gaps exceed the threshold, output is treated as progress/status
+    and streamed live to the terminal.
+    """
     if sandbox:
         import docker_sandbox
         return docker_sandbox.docker_exec(exec_cmd)
 
-    from display import SHELL_OUTPUT_BG, CLEAR_LINE, RESET
-
     shell_bin = shutil.which("bash") or "/bin/sh"
     p = subprocess.Popen(exec_cmd, shell=True, executable=shell_bin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=0, cwd=cwd or os.getcwd())
+
     lines = []
+    buffered_lines = []          # lines collected during burst phase
+    streaming = False             # have we switched to live-stream mode?
+    threshold_s = BURST_GAP_MS / 1000.0
+    prev_ts = None                # timestamp of previous line arrival
+
     # Watchdog thread to kill the process if it exceeds timeout
     killed_by_watchdog = threading.Event()
 
@@ -153,14 +180,25 @@ def stream_command_output(exec_cmd: str, color_code: str = "90m", cwd: str = Non
     interrupted = False
     try:
         for l in p.stdout:
-            if not color_code:
-                print(l, end="")
-            elif color_code == "90m":
-                w = shutil.get_terminal_size((80, 20)).columns
-                print(f"{SHELL_OUTPUT_BG}{l.rstrip().ljust(w)}{CLEAR_LINE}{RESET}", end="\n")
+            now = time.monotonic()
+            text = l.rstrip('\n')
+            lines.append(text)
+
+            # Decide burst vs stream based on inter-line gap
+            if prev_ts is not None and not streaming:
+                gap = now - prev_ts
+                if gap > threshold_s:
+                    streaming = True
+                    # Flush buffered lines to screen (they're the "head")
+                    for bl in buffered_lines:
+                        _print_line(bl + "\n", color_code)
+
+            if streaming:
+                _print_line(l, color_code)
             else:
-                print(f"\033[{color_code}{l.rstrip()}\033[0m", end="\n")
-            lines.append(l.rstrip('\n'))
+                buffered_lines.append(text)
+
+            prev_ts = now
 
         p.wait()
     except KeyboardInterrupt:

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from config import _Config, _get_args
+from token_counter import count_tokens
 from llm_client import llm_request, _model_tag
 from action_parser import parse_xml_actions
 from shell_executor import (
@@ -216,7 +217,7 @@ class LocalAgent:
 
     def _estimate_tokens(self) -> int:
         """Rough token estimate for the current message list."""
-        return sum(len(str(m.get("content", ""))) // 4 for m in self.messages)
+        return sum(count_tokens(str(m.get("content", ""))) for m in self.messages)
 
     def _ensure_context_fits(self):
         """Force-compress if context is dangerously close to the window limit."""
