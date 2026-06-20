@@ -235,6 +235,20 @@ _DIFF_DEL_BG   = "\033[48;5;52m"
 _DIFF_CTX_BG   = "\033[48;5;236m"
 
 
+def _apply_bg(text: str, bg_code: str) -> str:
+    """Wrap text with a background colour, preserving existing resets.
+
+    After every \\033[0m (reset) inside *text*, re-inject the background
+    so syntax-highlighted segments don't lose the tint.
+    """
+    return (
+        bg_code
+        + text.replace("\033[0m", "\033[0m" + bg_code)
+        + _CLEAR_LINE
+        + _RESET
+    )
+
+
 def _char_display_width(ch: str) -> int:
     """Return the terminal column width for a single character.
 
@@ -853,10 +867,10 @@ def render_md(text: str):
             if hl_fn is not None:
                 highlighted = hl_fn(inner)
                 for line in highlighted.split("\n"):
-                    res.append(f"{_BG_BODY}  {line.ljust(w - 2)}{_CLEAR_LINE}{_RESET}")
+                    res.append(_apply_bg(f"  {line}", _BG_BODY))
             else:
                 for line in inner.split("\n"):
-                    res.append(f"{_BG_BODY}  {line.ljust(w - 2)}{_CLEAR_LINE}{_RESET}")
+                    res.append(_apply_bg(f"  {line}", _BG_BODY))
 
         elif tag == "edit":
             header = f" [EDIT] {path} " + (f"({remote})" if remote != "local" else "")
@@ -908,14 +922,15 @@ def render_md(text: str):
                                 res.append(f"{_DIFF_CTX_BG} \033[38;5;245m {content.ljust(w - 4)}{_CLEAR_LINE}{_RESET}")
             else:
                 for line in inner.split("\n"):
-                    res.append(f"{_BG_BODY}  {line.ljust(w - 2)}{_CLEAR_LINE}{_RESET}")
+                    res.append(_apply_bg(f"  {line}", _BG_BODY))
 
         elif tag == "shell":
             header = f" [SHELL] {remote} " if remote != "local" else " [SHELL] "
             res.append(f"{_BG_SHELL_HDR}{_BOLD}{header.ljust(w)}{_CLEAR_LINE}{_RESET}")
             highlighted = highlight_bash(inner)
             for line in highlighted.split("\n"):
-                res.append(f"{_BG_SHELL_BODY}  $ {_pad_to(line, w - 4)}{_CLEAR_LINE}{_RESET}")
+                content = f"  $ {_pad_to(line, w - 4)}"
+                res.append(_apply_bg(content, _BG_SHELL_BODY))
 
         res.append("")
         return "\n".join(res)
