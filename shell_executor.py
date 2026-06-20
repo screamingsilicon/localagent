@@ -5,9 +5,95 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
+
+
+# Truncation limits for shell command output (dual-limit: lines AND bytes)
+SHELL_MAX_LINES = 1000           # max lines to include in tool result
+SHELL_MAX_BYTES = 64 * 1024      # max bytes (~64KB) to include in tool result
+
+
+def truncate_output(
+    raw_text: str,
+    max_lines: int = SHELL_MAX_LINES,
+    max_bytes: int = SHELL_MAX_BYTES,
+) -> tuple[str, bool, str | None]:
+    """Truncate output using dual limits: lines AND bytes (whichever is hit first).
+
+    Keeps the TAIL of the output (most recent lines), since that's where errors
+    and results typically appear. Full output is saved to a temp file when truncated.
+
+    Args:
+        raw_text: The full command output.
+        max_lines: Maximum number of lines to include.
+        max_bytes: Maximum bytes to include (UTF-8 encoded).
+
+    Returns:
+        (truncated_text, was_truncated, temp_file_path_or_none)
+        - truncated_text: The text to include in the tool result.
+        - was_truncated: True if any truncation occurred.
+        - temp_file_path_or_none: Path to temp file with full output, or None.
+    """
+    lines = raw_text.split("\n")
+    # Handle trailing newline: "a\nb\n" splits to ["a", "b", ""], but that's 2 lines
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+
+    total_lines = len(lines)
+    raw_bytes = len(raw_text.encode("utf-8"))
+
+    # Check if truncation is needed (dual limit: whichever is hit first)
+    exceeded_lines = total_lines > max_lines
+    exceeded_bytes = raw_bytes > max_bytes
+    needs_truncation = exceeded_lines or exceeded_bytes
+
+    if not needs_truncation:
+        return raw_text, False, None
+
+    # Write full output to temp file
+    _, tmp = tempfile.mkstemp(prefix="localagent_sh_", suffix=".txt", text=True)
+    Path(tmp).write_text(raw_text, encoding="utf-8")
+
+    if exceeded_lines:
+        # Line limit was hit — keep the last max_lines lines
+        kept_lines = lines[-max_lines:]
+        start_line = total_lines - max_lines + 1
+        truncated_text = "\n".join(kept_lines)
+        truncated_by = "lines"
+    else:
+        # Byte limit was hit (but line count is OK) — keep last lines until under limit
+        kept_lines = []
+        accumulated_bytes = 0
+        for line in reversed(lines):
+            line_bytes = len(line.encode("utf-8")) + 1  # +1 for the newline
+            if accumulated_bytes + line_bytes > max_bytes and kept_lines:
+                break
+            kept_lines.insert(0, line)
+            accumulated_bytes += line_bytes
+
+        truncated_text = "\n".join(kept_lines)
+        start_line = total_lines - len(kept_lines) + 1
+        truncated_by = "bytes"
+
+    # Build the truncated output with metadata header
+    if exceeded_lines:
+        header = (
+            f"...\n"
+            f"[Showing lines {start_line}-{total_lines} of {total_lines}. "
+            f"Full output: {tmp}]"
+        )
+    else:
+        kept_bytes = len(truncated_text.encode("utf-8"))
+        header = (
+            f"...\n"
+            f"[Output truncated ({raw_bytes} bytes, showing last {kept_bytes} bytes. "
+            f"Full output: {tmp})]"
+        )
+
+    return f"{header}\n{truncated_text}", True, tmp
 
 
 def run_command(cmd: str) -> str | None:
@@ -201,10 +287,9 @@ def execute_shell(act: dict, auto_mode: bool, cwd: str, sandbox: bool, sudo_cach
     lines, rcode = stream_command_output(shell_cmd, "90m", cwd=cwd, sandbox=sandbox, timeout=timeout)
     out = "\n".join(lines)
 
-    if len(lines) > 1000:
-        _, tmp = tempfile.mkstemp(prefix="localagent_sh_", suffix=".txt", text=True)
-        Path(tmp).write_text(out, encoding="utf-8")
-        out = f"...\n[Output truncated. Full saved to {tmp}]\n..."
+    truncated_text, was_truncated, tmp_path = truncate_output(out)
+    if was_truncated:
+        out = truncated_text
 
     if log_tool_call:
         log_tool_call("shell", rcode == 0, {"cmd": cmd})
