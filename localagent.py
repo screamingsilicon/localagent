@@ -23,12 +23,77 @@ from context_manager import compress_context
 APP_NAME = "localagent"
 
 
+def _run_in_container(cmd: str) -> str:
+    """Run a command inside the sandbox container and return stdout."""
+    import subprocess
+    container = docker_sandbox.get_container_name()
+    if not container:
+        return ""
+    try:
+        result = subprocess.run(
+            ["docker", "exec", "-i", container, "sh", "-c", cmd],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _container_system_info() -> dict[str, Any]:
+    """Collect system info from inside the sandbox container."""
+    info: dict[str, Any] = {
+        "os": "Linux (Docker sandbox)",
+        "release": _run_in_container("uname -r"),
+        "python": _run_in_container("python3 --version 2>&1") or "unknown",
+        "cwd": "/workspace",
+        "shell": _run_in_container("echo $SHELL") or "/bin/sh",
+        "user": _run_in_container("id -un") or f"uid-{_run_in_container('id -u')}",
+        "cpu_cores": 0,
+    }
+
+    # CPU cores
+    cores = _run_in_container("nproc")
+    if cores.isdigit():
+        info["cpu_cores"] = int(cores)
+
+    # Memory
+    mem = _run_in_container("cat /proc/meminfo | head -1")
+    if mem:
+        try:
+            parts = mem.split()
+            kb = int(parts[1])
+            info["memory_total_gb"] = round(kb / (1024 * 1024), 1)
+        except Exception:
+            pass
+
+    # Installed tools the agent might want to know about
+    tools = ["git", "node", "npm", "jq", "rg", "fd", "sqlite3", "cmake", "patch", "diff"]
+    available = []
+    for tool in tools:
+        if _run_in_container(f"which {tool}") and True:
+            available.append(tool)
+    if available:
+        info["available_tools"] = available
+
+    return info
+
+
 def system_summary() -> dict[str, Any]:
-    """Return a JSON-serializable system info dict."""
+    """Return a JSON-serializable system info dict.
+
+    When running in sandbox mode, queries the container for its actual
+    environment instead of reporting host information.
+    """
     import platform
     import sys
 
-    cwd = "/workspace" if _Config.sandbox() else os.getcwd()
+    if _Config.sandbox():
+        # Import here to avoid circular imports at module level
+        global docker_sandbox
+        import docker_sandbox  # noqa: PLC0415
+        return _container_system_info()
+
+    cwd = os.getcwd()
     sum_d = {
         "os": platform.system(),
         "release": platform.release(),
@@ -116,7 +181,9 @@ class LocalAgent:
 
     def run_agent_turn(self, req: str):
         if not self._initial_context_sent:
-            req = f"### System\n{json.dumps(system_summary())}\n\n{req}"
+            sys_info = system_summary()
+            info_lines = [f"{k}: {v}" for k, v in sys_info.items()]
+            req = f"### System\n" + "\n".join(info_lines) + f"\n\n{req}"
             self._initial_context_sent = True
 
         if self.pending_notes:

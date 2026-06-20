@@ -14,14 +14,26 @@ import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Tuple, Optional
 
 
 IMAGE_NAME = "localagent-image"
-DOCKERFILE = """FROM python:3.12-alpine
-RUN apk add --no-cache git tmux
-WORKDIR /workspace
-"""
+
+
+def _read_dockerfile() -> str:
+    """Read Dockerfile from disk, falling back to a minimal default."""
+    for candidate in [
+        Path(os.getcwd()) / "Dockerfile",
+        Path("/workspace/Dockerfile"),
+    ]:
+        if candidate.is_file():
+            return candidate.read_text(encoding="utf-8").strip()
+    return (
+        "FROM python:3.12-alpine\n"
+        "RUN apk add --no-cache git tmux\n"
+        "WORKDIR /workspace\n"
+    )
 
 SHELL_OUTPUT_BG = "\033[48;5;235;90m"
 CLEAR_LINE = "\033[K"
@@ -47,7 +59,7 @@ def ensure_docker_image() -> None:
     try:
         subprocess.run(
             ["docker", "build", "-t", IMAGE_NAME, "-"],
-            input=DOCKERFILE,
+            input=_read_dockerfile(),
             text=True,
             check=True,
             capture_output=True,
