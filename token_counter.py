@@ -11,7 +11,6 @@ Accuracy: typically within 8–15% of actual tiktoken counts on real English/cod
 from __future__ import annotations
 
 import re
-import unicodedata
 from typing import Final
 
 

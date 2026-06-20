@@ -16,7 +16,6 @@ import subprocess
 import unicodedata
 from difflib import unified_diff
 from pathlib import Path
-from typing import Optional
 
 
 MAX_FILE_SIZE = 256 * 1024  
@@ -327,9 +326,14 @@ def read_file(
     """
     
     if remote:
+        import base64 as _b64
+        encoded = _b64.b64encode(path.encode()).decode()
+        shell_cmd = (
+            f"ssh {remote} "
+            f"'echo {encoded} | base64 -d | xargs -0 cat'"
+        )
         p = subprocess.run(
-            f"ssh {remote} \"cat '{path}'\"",
-            shell=True, capture_output=True, text=True,
+            shell_cmd, shell=True, capture_output=True, text=True, timeout=30,
         )
         return (p.stdout, None) if p.returncode == 0 else (None, p.stderr.strip())
 

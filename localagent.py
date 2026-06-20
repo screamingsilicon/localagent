@@ -7,16 +7,15 @@ import time
 from pathlib import Path
 from typing import Any
 
-from config import _Config, _get_args
+from config import _Config
 from token_counter import count_tokens
-from llm_client import llm_request, _model_tag
+from llm_client import llm_request
 from action_parser import parse_xml_actions
 from shell_executor import (
     stream_command_output, execute_shell,
     _SudoCache, run_command, is_safe_read_command,
 )
 from file_editor import execute_edit, execute_write
-from display import set_terminal_title
 from session_manager import SessionManager
 from context_manager import compress_context
 
@@ -24,6 +23,15 @@ from context_manager import compress_context
 APP_NAME = "localagent"
 
 _log = logging.getLogger(APP_NAME)
+
+
+# ── Turn-level behaviour knobs ────────────────────────────────────────
+_TURN_TIMEOUT              = 600   # seconds before a turn is auto-aborted
+_MAX_ITERATIONS            = 50    # max LLM round-trips per user request
+_CONTEXT_OVERFLOW_RATIO    = 0.92  # force-compact when context exceeds this fraction of window
+_CONTEXT_COMPRESS_RATIO    = 0.65  # soft-compact above this fraction
+_MAX_NO_ACTION_NUDGES      = 3     # nudges before giving up on actionless responses
+_MAX_CONSECUTIVE_ERRORS    = 5     # hard-stop after this many errors in a row
 
 
 def _run_in_container(cmd: str, timeout: int = 10) -> str:
@@ -222,7 +230,7 @@ class LocalAgent:
     def _ensure_context_fits(self):
         """Force-compress if context is dangerously close to the window limit."""
         ctx_window = _Config.context_window()
-        if self._estimate_tokens() > int(ctx_window * 0.92):
+        if self._estimate_tokens() > int(ctx_window * _CONTEXT_OVERFLOW_RATIO):
             _log.warning("Context near overflow (%d / %d tokens), force-compacting",
                          self._estimate_tokens(), ctx_window)
             self.compress_context()
@@ -230,7 +238,7 @@ class LocalAgent:
     def _maybe_compress_context(self):
         """Compress only when context exceeds the configured threshold."""
         ctx_window = _Config.context_window()
-        if self._estimate_tokens() > int(ctx_window * 0.65):
+        if self._estimate_tokens() > int(ctx_window * _CONTEXT_COMPRESS_RATIO):
             self.compress_context()
 
     # -- Main agent loop ------------------------------------------------------
@@ -250,15 +258,15 @@ class LocalAgent:
         self.log_message("user", req)
 
         NO_ACTION_NUDGE = "You didn't include any action tags (<shell>, <edit>, or <write>). If you are done, reply with <done/> otherwise continue."
-        max_nudges = 3
+        
         consecutive_no_action = 0
-
+        consecutive_errors = 0
+        
         # Turn-level timeout guard (10 minutes)
         turn_start = time.monotonic()
-        TURN_TIMEOUT = 600
-
-        for iteration in range(50):
-            if time.monotonic() - turn_start > TURN_TIMEOUT:
+        
+        for iteration in range(_MAX_ITERATIONS):
+            if time.monotonic() - turn_start > _TURN_TIMEOUT:
                 print("\n\033[33m⚠ Turn timed out after 10 minutes. Moving on.\033[0m")
                 break
 
@@ -286,14 +294,15 @@ class LocalAgent:
                         break
 
                     consecutive_no_action += 1
-                    if consecutive_no_action > max_nudges:
-                        print(f"\n\033[33m⚠ Model didn't produce any actions after {max_nudges} nudges. Moving on.\033[0m")
+                    if consecutive_no_action > _MAX_NO_ACTION_NUDGES:
+                        print(f"\n\033[33m⚠ Model didn't produce any actions after {_MAX_NO_ACTION_NUDGES} nudges. Moving on.\033[0m")
                         break
-                    print(f"\n\033[90m⚡ Nudge ({consecutive_no_action}/{max_nudges}): model produced no actions, retrying...\033[0m")
+                    print(f"\n\033[90m⚡ Nudge ({consecutive_no_action}/{_MAX_NO_ACTION_NUDGES}): model produced no actions, retrying...\033[0m")
                     self.messages.append({"role": "user", "content": NO_ACTION_NUDGE})
                     continue
 
                 consecutive_no_action = 0
+                consecutive_errors = 0
                 print()
                 results = []
                 for a in actions:
@@ -315,10 +324,19 @@ class LocalAgent:
                 self._session_mgr.log_event("turn_interrupted")
                 break
             except Exception as exc:
-                _log.exception("Unexpected error in agent turn")
-                print(f"\n\033[31m✖ Error: {exc}\033[0m")
+                _log.exception("Error in agent turn – feeding back to LLM")
+                error_msg = f"\033[31m[Error]\033[0m {exc}"
+                print(f"\n{error_msg}")
                 self._session_mgr.log_event("turn_error", detail=str(exc))
-                break
+
+                consecutive_errors += 1
+                if consecutive_errors > _MAX_CONSECUTIVE_ERRORS:
+                    print(f"\n\033[33m⚠ Too many consecutive errors ({_MAX_CONSECUTIVE_ERRORS}). Giving up.\033[0m")
+                    break
+
+                # Feed the error back to the LLM so it can self-correct
+                err_feedback = f"Your previous response caused an error:\n\n```\n{exc}\n```\n\nPlease fix the issue and try again."
+                self.messages.append({"role": "user", "content": err_feedback})
 
     # -- REPL entry point -----------------------------------------------------
 
