@@ -61,6 +61,7 @@ def ensure_docker_image() -> None:
             ["docker", "build", "-t", IMAGE_NAME, "-"],
             input=_read_dockerfile(),
             text=True,
+            bufsize=0,
             check=True,
             capture_output=True,
         )
@@ -170,6 +171,7 @@ def docker_exec_file_write(path: str, content: str) -> int:
         ["docker", "exec", "-i", _SANDBOX_CONTAINER, "sh", "-c", f"cat > '{path}'"],
         input=content,
         text=True,
+        bufsize=0,
         capture_output=True,
     )
     return p.returncode

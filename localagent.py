@@ -38,7 +38,7 @@ def _run_in_container(cmd: str, timeout: int = 10) -> str:
     try:
         result = subprocess.run(
             ["docker", "exec", "-i", container, "sh", "-c", cmd],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, timeout=timeout, bufsize=0,
         )
         return result.stdout.strip()
     except subprocess.TimeoutExpired:
@@ -312,6 +312,11 @@ class LocalAgent:
                 if self.messages and self.messages[-1].get("role") == "user":
                     self.messages.pop()
                 self._session_mgr.log_event("turn_interrupted")
+                break
+            except Exception as exc:
+                _log.exception("Unexpected error in agent turn")
+                print(f"\n\033[31m✖ Error: {exc}\033[0m")
+                self._session_mgr.log_event("turn_error", detail=str(exc))
                 break
 
     # -- REPL entry point -----------------------------------------------------

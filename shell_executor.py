@@ -129,7 +129,7 @@ def stream_command_output(exec_cmd: str, color_code: str = "90m", cwd: str = Non
     from display import SHELL_OUTPUT_BG, CLEAR_LINE, RESET
 
     shell_bin = shutil.which("bash") or "/bin/sh"
-    p = subprocess.Popen(exec_cmd, shell=True, executable=shell_bin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=cwd or os.getcwd())
+    p = subprocess.Popen(exec_cmd, shell=True, executable=shell_bin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=0, cwd=cwd or os.getcwd())
     lines = []
     # Watchdog thread to kill the process if it exceeds timeout
     killed_by_watchdog = threading.Event()
