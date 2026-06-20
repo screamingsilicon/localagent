@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -38,7 +39,7 @@ class TestSessionManagerLogEvent(unittest.TestCase):
 
 
 class TestTokenEstimation(unittest.TestCase):
-    """P1#3: Context window overflow protection helpers."""
+    """P1#3: Context window overflow protection helpers using count_tokens_messages."""
 
     def _make_agent(self):
         from localagent import LocalAgent
@@ -53,18 +54,29 @@ class TestTokenEstimation(unittest.TestCase):
         self.assertEqual(agent._estimate_tokens(), 0)
 
     def test_estimate_tokens_basic(self):
+        """_estimate_tokens delegates to count_tokens_messages."""
+        from token_counter import count_tokens_messages
         agent = self._make_agent()
-        agent.messages = [{"role": "user", "content": "A" * 80}]
-        self.assertEqual(agent._estimate_tokens(), 20)
+        agent.messages = [{"role": "user", "content": "hello world"}]
+        expected = count_tokens_messages(agent.messages)
+        self.assertEqual(agent._estimate_tokens(), expected)
+        self.assertGreater(expected, 0)
 
     def test_estimate_tokens_multiple_messages(self):
+        """Token count increases with more messages."""
+        from token_counter import count_tokens_messages
         agent = self._make_agent()
-        agent.messages = [
-            {"role": "system", "content": "S" * 400},
-            {"role": "user", "content": "U" * 200},
-            {"role": "assistant", "content": "A" * 600},
+        msgs = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Hello, how are you?"},
+            {"role": "assistant", "content": "I am doing well, thank you for asking!"},
         ]
-        self.assertEqual(agent._estimate_tokens(), 300)
+        agent.messages = msgs
+        expected = count_tokens_messages(msgs)
+        self.assertEqual(agent._estimate_tokens(), expected)
+        # Verify it's more than a single message would be
+        single = count_tokens_messages([msgs[0]])
+        self.assertGreater(expected, single)
 
 
 class TestEnsureContextFits(unittest.TestCase):
@@ -72,10 +84,12 @@ class TestEnsureContextFits(unittest.TestCase):
 
     def test_ensure_context_triggers_compaction_near_limit(self):
         from localagent import LocalAgent
+        # Use varied content that doesn't compress as well (unique words)
+        varied = " ".join(f"word{i}" for i in range(500))  # ~500 unique tokens
         with patch('localagent._Config') as mock_config:
             mock_config.context_window.return_value = 1000
             agent = LocalAgent.__new__(LocalAgent)
-            agent.messages = [{"role": "user", "content": "X" * 4000}]
+            agent.messages = [{"role": "user", "content": varied}]
             agent.compress_context = MagicMock()
             agent._ensure_context_fits()
             agent.compress_context.assert_called_once()
@@ -133,13 +147,13 @@ class TestDeadCodeRemoved(unittest.TestCase):
 
 
 class TestErrorLogging(unittest.TestCase):
-    """P0#2: _run_in_container logs warnings on failure."""
+    """P0#2: _run_in_container logs warnings on failure (uses lazy docker_sandbox loader)."""
 
     def test_logs_warning_on_no_container(self):
         import localagent
         mock_ds = MagicMock()
         mock_ds.get_container_name.return_value = None
-        with patch.dict(localagent.__dict__, {'docker_sandbox': mock_ds}):
+        with patch.object(localagent, '_get_docker_sandbox', return_value=mock_ds):
             with patch.object(localagent._log, 'warning') as mock_warn:
                 localagent._run_in_container("echo hi")
                 mock_warn.assert_called_once()
@@ -147,10 +161,9 @@ class TestErrorLogging(unittest.TestCase):
 
     def test_logs_warning_on_timeout(self):
         import localagent
-        import subprocess
         mock_ds = MagicMock()
         mock_ds.get_container_name.return_value = "test-container"
-        with patch.dict(localagent.__dict__, {'docker_sandbox': mock_ds}):
+        with patch.object(localagent, '_get_docker_sandbox', return_value=mock_ds):
             with patch('subprocess.run', side_effect=subprocess.TimeoutExpired(cmd="test", timeout=5)):
                 with patch.object(localagent._log, 'warning') as mock_warn:
                     localagent._run_in_container("slow cmd")
@@ -161,7 +174,7 @@ class TestErrorLogging(unittest.TestCase):
         import localagent
         mock_ds = MagicMock()
         mock_ds.get_container_name.return_value = "test-container"
-        with patch.dict(localagent.__dict__, {'docker_sandbox': mock_ds}):
+        with patch.object(localagent, '_get_docker_sandbox', return_value=mock_ds):
             with patch('subprocess.run', side_effect=RuntimeError("boom")):
                 with patch.object(localagent._log, 'warning') as mock_warn:
                     localagent._run_in_container("bad cmd")
@@ -170,30 +183,29 @@ class TestErrorLogging(unittest.TestCase):
 
 
 class TestBatchContainerProbe(unittest.TestCase):
-    """P2#5: Verify batch probing uses single docker exec."""
+    """P2#5: Verify batch probing uses null-byte delimiter (robust against command output)."""
 
     def test_probe_uses_delimiter(self):
-        self.assertIn('|||', LA_PATH.read_text(), "batch probe should use ||| delimiter")
-        self.assertIn("set -euo pipefail", LA_PATH.read_text(), "should set strict mode")
+        text = LA_PATH.read_text()
+        self.assertIn("\\x00", text, "batch probe should use \\x00 (null byte) delimiter")
+        self.assertIn("set -euo pipefail", text, "should set strict mode")
 
     def test_batch_probe_parses_output(self):
         import localagent
-        SEP = "|||"
-        fake_output = (
-            f"{SEP}6.8.0-test\n"
-            f"{SEP}Python 3.12.13\n"
-            f"{SEP}/bin/bash\n"
-            f"{SEP}agent\n"
-            f"{SEP}4\n"
-            f"{SEP}MemTotal:       4194304 kB\n"
-            f"{SEP}/usr/bin/git\n/usr/bin/node\n/usr/bin/jq\n"
-        )
-        mock_ds = MagicMock()
-        mock_ds.get_container_name.return_value = "test"
-        with patch.dict(localagent.__dict__, {'docker_sandbox': mock_ds}):
-            with patch('subprocess.run') as mock_run:
-                mock_run.return_value = MagicMock(stdout=fake_output)
-                info = localagent._container_system_info()
+        # Null-byte separated output format
+        fake_output = "\x00".join([
+            "6.8.0-test",
+            "Python 3.12.13",
+            "/bin/bash",
+            "agent",
+            "4",
+            "MemTotal:       4194304 kB",
+            "/usr/bin/git\n/usr/bin/node\n/usr/bin/jq",
+        ]) + "\x00"
+
+        with patch.object(localagent, '_run_in_container', return_value=fake_output):
+            info = localagent._container_system_info()
+
         self.assertEqual(info["release"], "6.8.0-test")
         self.assertEqual(info["python"], "Python 3.12.13")
         self.assertEqual(info["shell"], "/bin/bash")
@@ -208,17 +220,26 @@ class TestTurnTimeout(unittest.TestCase):
 
     def test_turn_timeout_constant(self):
         text = LA_PATH.read_text()
-        self.assertIn("TURN_TIMEOUT = 600", text)
-        self.assertIn("time.monotonic()", text)
+        self.assertIn("_TURN_TIMEOUT", text, "timeout constant should be defined")
+        self.assertIn("= 600", text, "timeout should be 600 seconds")
+        self.assertIn("time.monotonic()", text, "should use monotonic clock")
 
 
 class TestSafeDockerSandboxImport(unittest.TestCase):
-    """P2#8: ImportError is caught in system_summary."""
+    """P2#8: ImportError is caught via lazy loader in _get_docker_sandbox."""
 
-    def test_import_error_caught(self):
-        text = LA_PATH.read_text()
-        self.assertIn("except ImportError", text)
-        self.assertIn("Cannot import docker_sandbox", text)
+    def test_lazy_loader_exists(self):
+        import localagent
+        self.assertTrue(hasattr(localagent, '_get_docker_sandbox'))
+        self.assertTrue(callable(localagent._get_docker_sandbox))
+
+    def test_lazy_loader_returns_none_on_import_error(self):
+        import localagent
+        # Reset the cached module to None for testing
+        localagent._docker_sandbox_module = None
+        with patch('builtins.__import__', side_effect=ImportError("no docker")):
+            result = localagent._get_docker_sandbox()
+            self.assertIsNone(result)
 
 
 class TestPrivateMemberAccessRemoved(unittest.TestCase):

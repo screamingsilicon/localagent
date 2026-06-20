@@ -6,13 +6,6 @@ from pathlib import Path
 from typing import Any
 
 
-def format_relative_time(ts: float) -> str:
-    """Format a timestamp as a relative time string."""
-    diff = time.time() - ts
-    for unit, limit in [("d", 86400), ("h", 3600), ("m", 60)]:
-        if diff >= limit:
-            return f"{int(diff // limit)}{unit} ago"
-    return "just now"
 
 
 class SessionManager:
@@ -42,6 +35,15 @@ class SessionManager:
         if extra:
             rec.update(extra)
         self._write_log(rec)
+
+    def save(self):
+        """Flush and sync session file to disk (for explicit flush points)."""
+        fd = self.session_file.open("a")
+        try:
+            import os as _os
+            _os.fsync(fd.fileno())
+        finally:
+            fd.close()
 
     def list_sessions(self) -> list[dict[str, Any]]:
         sessions = []

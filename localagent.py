@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from config import _Config
-from token_counter import count_tokens
+from token_counter import count_tokens, count_tokens_messages
 from llm_client import llm_request
 from action_parser import parse_xml_actions
 from shell_executor import (
@@ -33,6 +33,21 @@ _CONTEXT_COMPRESS_RATIO    = 0.65  # soft-compact above this fraction
 _MAX_NO_ACTION_NUDGES      = 3     # nudges before giving up on actionless responses
 _MAX_CONSECUTIVE_ERRORS    = 5     # hard-stop after this many errors in a row
 
+# ── Lazy docker_sandbox loader ────────────────────────────────────────
+_docker_sandbox_module = None
+
+
+def _get_docker_sandbox():
+    """Return the docker_sandbox module, lazily imported."""
+    global _docker_sandbox_module  # noqa: PLW0603
+    if _docker_sandbox_module is None:
+        try:
+            import docker_sandbox as ds  # noqa: PLC0415
+            _docker_sandbox_module = ds
+        except ImportError:
+            pass
+    return _docker_sandbox_module
+
 
 def _run_in_container(cmd: str, timeout: int = 10) -> str:
     """Run a command inside the sandbox container and return stdout.
@@ -40,7 +55,11 @@ def _run_in_container(cmd: str, timeout: int = 10) -> str:
     Logs a warning on any failure instead of silently returning "".
     """
     import subprocess
-    container = docker_sandbox.get_container_name()
+    ds = _get_docker_sandbox()
+    if ds is None:
+        _log.warning("docker_sandbox not available for _run_in_container")
+        return ""
+    container = ds.get_container_name()
     if not container:
         _log.warning("No container name available for _run_in_container")
         return ""
@@ -59,17 +78,20 @@ def _run_in_container(cmd: str, timeout: int = 10) -> str:
 
 
 def _container_system_info() -> dict[str, Any]:
-    """Collect system info from inside the sandbox container in one batch call."""
-    SEP = "|||"  # Non-whitespace delimiter safe for .strip()
+    """Collect system info from inside the sandbox container in one batch call.
+
+    Uses null-byte delimited output to avoid delimiter collision with command output.
+    """
     probe = (
-        f'set -euo pipefail\n'
-        f'echo "{SEP}$(uname -r 2>/dev/null || echo unknown)"\n'
-        f'echo "{SEP}$(python3 --version 2>&1 || echo unknown)"\n'
-        'echo "' + SEP + '${SHELL:-/bin/sh}"\n'
-        f'echo "{SEP}$(id -un 2>/dev/null || id -u 2>/dev/null || echo unknown)"\n'
-        f'echo "{SEP}$(nproc 2>/dev/null || echo 0)"\n'
-        f'echo "{SEP}$(head -1 /proc/meminfo 2>/dev/null || true)"\n'
-        f'echo "{SEP}$(which git node npm jq rg fd sqlite3 cmake patch diff 2>/dev/null || true)"\n'
+        'set -euo pipefail; '
+        'printf "%s\\0%s\\0%s\\0%s\\0%s\\0%s\\0%s\\0" '
+        '"$(uname -r 2>/dev/null || echo unknown)" '
+        '"$(python3 --version 2>&1 || echo unknown)" '
+        '"${SHELL:-/bin/sh}" '
+        '"$(id -un 2>/dev/null || id -u 2>/dev/null || echo unknown)" '
+        '"$(nproc 2>/dev/null || echo 0)" '
+        '"$(head -1 /proc/meminfo 2>/dev/null || true)" '
+        '"$(which git node npm jq rg fd sqlite3 cmake patch diff 2>/dev/null || true)"'
     )
     raw = _run_in_container(probe, timeout=5)
     if not raw:
@@ -77,25 +99,24 @@ def _container_system_info() -> dict[str, Any]:
         return {"os": "Linux (Docker sandbox)", "release": "unknown", "python": "unknown",
                 "cwd": "/workspace", "shell": "/bin/sh", "user": "unknown", "cpu_cores": 0}
 
-    parts = raw.split(SEP)
-    # parts[0] is empty due to leading separator
-    release = (parts[1].strip() if len(parts) > 1 else "unknown")
-    python_ver = (parts[2].strip() if len(parts) > 2 else "unknown")
-    shell = (parts[3].strip() if len(parts) > 3 else "/bin/sh") or "/bin/sh"
-    user = (parts[4].strip() if len(parts) > 4 else "unknown")
-    cores_str = (parts[5].strip() if len(parts) > 5 else "0")
-    mem_line = (parts[6].strip() if len(parts) > 6 else "")
-    tools_raw = (parts[7].strip() if len(parts) > 7 else "")
+    # Split on null bytes; filter empty entries from trailing null
+    parts = [p for p in raw.split("\x00") if p]
+    while len(parts) < 7:
+        parts.append("")
 
-    cpu_cores = int(cores_str) if cores_str.isdigit() else 0
+    release, python_ver, shell, user, cores_str, mem_line, tools_raw = (
+        parts[0], parts[1], parts[2], parts[3], parts[4], parts[5], parts[6]
+    )
+    shell = shell or "/bin/sh"
+    cpu_cores = int(cores_str) if cores_str.strip().isdigit() else 0
 
     info: dict[str, Any] = {
         "os": "Linux (Docker sandbox)",
-        "release": release,
-        "python": python_ver or "unknown",
+        "release": release.strip(),
+        "python": python_ver.strip() or "unknown",
         "cwd": "/workspace",
         "shell": shell,
-        "user": user,
+        "user": user.strip(),
         "cpu_cores": cpu_cores,
     }
 
@@ -129,13 +150,8 @@ def system_summary() -> dict[str, Any]:
     import sys as _sys
 
     if _Config.sandbox():
-        try:
-            global docker_sandbox  # noqa: PLW0603
-            if "docker_sandbox" not in globals() or docker_sandbox is None:
-                import docker_sandbox  # noqa: F821, PLC0415
+        if _get_docker_sandbox() is not None:
             return _container_system_info()
-        except ImportError as exc:
-            _log.warning("Cannot import docker_sandbox for system_summary: %s", exc)
 
     cwd = os.getcwd()
     sum_d = {
@@ -168,10 +184,13 @@ class LocalAgent:
 
         # Build system prompt
         sys_prompt = _Config.system_prompt()
+        _loaded_agents: list[str] = []
         for p in [Path("AGENTS.md"), Path.home() / ".localagent" / "AGENTS.md"]:
             if p.exists():
-                sys_prompt += f"\n\n### AGENTS.md\n{p.read_text('utf-8').strip()}"
-                break
+                sys_prompt += f"\n\n### AGENTS.md ({p})\n{p.read_text('utf-8').strip()}"
+                _loaded_agents.append(str(p))
+        if len(_loaded_agents) > 1:
+            _log.info("Loaded %d AGENTS.md files: %s", len(_loaded_agents), _loaded_agents)
 
         # Conversation state
         self.messages = [{"role": "system", "content": sys_prompt}]
@@ -225,7 +244,7 @@ class LocalAgent:
 
     def _estimate_tokens(self) -> int:
         """Rough token estimate for the current message list."""
-        return sum(count_tokens(str(m.get("content", ""))) for m in self.messages)
+        return count_tokens_messages(self.messages)
 
     def _ensure_context_fits(self):
         """Force-compress if context is dangerously close to the window limit."""

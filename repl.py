@@ -82,6 +82,10 @@ def run_repl(agent):
                     print(f"\033[90mCurrent LLM host: {_Config.llm_host()}\033[0m")
                 else:
                     _Config._llm_host = new_host
+                    # Invalidate context cache so it re-polls the new host
+                    for attr in ("_context_window", "_max_tokens", "_compress_threshold",
+                                 "_summarize_threshold", "_turn_prefix_tokens"):
+                        setattr(_Config, attr, None)
                     print(f"\033[32mLLM host changed to: {new_host}\033[0m")
             elif cmd == "/load":
                 sessions = agent.list_sessions()

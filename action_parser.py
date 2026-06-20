@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
+
+
+_log = logging.getLogger("localagent")
 
 
 def parse_xml_actions(text: str) -> list[dict[str, Any]]:
@@ -24,7 +28,7 @@ def parse_xml_actions(text: str) -> list[dict[str, Any]]:
         remote_m = re.search(r'\bremote="([^"]+)"', attrs)
         timeout_m = re.search(r'\btimeout="([^"]+)"', attrs)
 
-        act = {
+        act: dict[str, Any] = {
             "type": tag,
             "remote": remote_m.group(1) if remote_m else None,
             "path": path_m.group(1) if path_m else "",
@@ -38,8 +42,16 @@ def parse_xml_actions(text: str) -> list[dict[str, Any]]:
         elif tag == "edit":
             find_m = re.search(r'(?m)^[ \t]*<find>\n([\s\S]*?)\n^[ \t]*</find>', inner)
             rep_m = re.search(r'(?m)^[ \t]*<replace>\n([\s\S]*?)\n^[ \t]*</replace>', inner)
-            act["find"] = find_m.group(1).strip('\n') if find_m else ""
-            act["replace"] = rep_m.group(1).strip('\n') if rep_m else ""
+
+            if not find_m:
+                _log.warning("Malformed <edit>: missing <find> tag in %s", act.get("path", "?"))
+                continue
+            if not rep_m:
+                _log.warning("Malformed <edit>: missing <replace> tag in %s", act.get("path", "?"))
+                continue
+
+            act["find"] = find_m.group(1).strip('\n')
+            act["replace"] = rep_m.group(1).strip('\n')
 
         actions.append(act)
 
