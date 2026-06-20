@@ -132,14 +132,13 @@ def docker_exec(cmd: str, cwd: Optional[str] = None) -> Tuple[list[str], int]:
         docker_cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=False,
-        bufsize=1,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     lines: list[str] = []
     try:
-        for raw_line in p.stdout:
-            # Decode with 'replace' to handle binary/non-UTF-8 output gracefully
-            line = raw_line.decode("utf-8", errors="replace")
+        for line in p.stdout:
             lines.append(line.rstrip("\n"))
             w = shutil.get_terminal_size((80, 20)).columns
             print(
