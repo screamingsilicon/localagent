@@ -9,9 +9,7 @@ from pathlib import Path
 sys.path.insert(0, "/workspace")
 
 
-# ===================================================================
 # 1. No Truncation Needed (output fits within both limits)
-# ===================================================================
 def test_no_truncation_short_output():
     """Short output passes through unchanged."""
     from shell_executor import truncate_output
@@ -50,9 +48,7 @@ def test_no_truncation_empty_output():
     assert result == ""
 
 
-# ===================================================================
 # 2. Line Limit Truncation
-# ===================================================================
 def test_truncation_exceeds_lines():
     """Output exceeding line limit keeps tail."""
     from shell_executor import truncate_output
@@ -95,9 +91,7 @@ def test_truncation_many_lines():
     assert "Showing lines 9001-10000 of 10000" in result
 
 
-# ===================================================================
 # 3. Byte Limit Truncation (wide output)
-# ===================================================================
 def test_truncation_single_huge_line():
     """Single line exceeding byte limit is truncated."""
     from shell_executor import truncate_output
@@ -137,9 +131,7 @@ def test_truncation_json_like_output():
     assert tmp is not None
 
 
-# ===================================================================
 # 4. Both Limits Exceeded
-# ===================================================================
 def test_truncation_both_limits_exceeded():
     """Output exceeds both line AND byte limits — line limit takes priority."""
     from shell_executor import truncate_output
@@ -164,9 +156,7 @@ def test_truncation_bytes_exceeded_first():
     assert "bytes" in result.lower()
 
 
-# ===================================================================
 # 5. Custom Limits
-# ===================================================================
 def test_custom_line_limit():
     """Custom max_lines parameter works."""
     from shell_executor import truncate_output
@@ -186,9 +176,7 @@ def test_custom_byte_limit():
     assert truncated
 
 
-# ===================================================================
 # 6. Edge Cases
-# ===================================================================
 def test_truncation_unicode_content():
     """Unicode content is handled correctly in byte counting."""
     from shell_executor import truncate_output
@@ -253,9 +241,7 @@ def test_truncation_preserves_special_chars():
     assert "`cmd`" in result
 
 
-# ===================================================================
 # 7. Integration with execute_shell_action (smoke test)
-# ===================================================================
 def test_truncation_constant_values():
     """Constants have reasonable default values."""
     from shell_executor import SHELL_MAX_LINES, SHELL_MAX_BYTES
@@ -277,9 +263,7 @@ def test_truncation_result_format():
     assert "]" in result
 
 
-# ===================================================================
 # Runner
-# ===================================================================
 def run_tests():
     """Run all tests and report results."""
     import traceback

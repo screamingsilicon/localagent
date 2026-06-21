@@ -34,10 +34,16 @@ def _count_diff_lines(diff: str) -> tuple[int, int]:
 
 
 def execute_edit(act: dict, cwd: str, auto_mode: bool, sandbox: bool, log_tool_call=None) -> str:
-    """Execute an edit action on a file."""
+    """Execute an edit action on a file (supports multiple find/replace pairs)."""
     from file_ops import read_file, write_file, check_syntax, format_diff, find_and_replace, normalize_text
 
-    path, rem, f_txt, r_txt = act["path"], act["remote"], act["find"], act["replace"]
+    path = act["path"]
+    rem  = act["remote"]
+
+    # Support both single-edit keys and multi-edit lists
+    finds    = act.get("finds", [act["find"]])
+    replaces = act.get("replaces", [act["replace"]])
+    n_pairs  = min(len(finds), len(replaces))
 
     content, err = read_file(path, cwd, rem, sandbox=sandbox)
     if err == "path_escapes":
@@ -53,29 +59,41 @@ def execute_edit(act: dict, cwd: str, auto_mode: bool, sandbox: bool, log_tool_c
         if log_tool_call: log_tool_call("edit", False, {"err": err})
         return f"Error reading {path}: {err}"
 
-    # Common edit logic (shared by both normal and escape-path branches)
-    try:
-        base, new, start_line, end_line = find_and_replace(
-            normalize_text(content if content != "[empty]" else "", strict=True),
-            f_txt, r_txt, path, strict=bool(rem)
-        )
-    except Exception as e:
-        if log_tool_call: log_tool_call("edit", False, {"err": str(e)})
-        return f"Edit failed: {e}"
+    # --- Apply all find/replace pairs sequentially -----------------------------------
+    original = normalize_text(content if content != "[empty]" else "", strict=True)
+    working  = original
 
-    # Syntax check
-    ok = check_syntax(path, new)
-    if not ok[0]:
-        if log_tool_call: log_tool_call("edit", False, {"err": ok[1]})
-        return f"Syntax Error: {ok[1]}"
+    span_info = []   # list of (start_line, end_line, n_removed, n_added) per pair
 
-    diff = format_diff(base, new)
-    n_removed, n_added = _count_diff_lines(diff)
+    for i in range(n_pairs):
+        try:
+            _, new, start_line, end_line = find_and_replace(
+                working, finds[i], replaces[i], path, strict=bool(rem)
+            )
+        except Exception as e:
+            if log_tool_call: log_tool_call("edit", False, {"err": str(e), "pair": i + 1})
+            return f"Edit failed on pair {i + 1}/{n_pairs}: {e}"
+
+        # Syntax check after every replacement (Python files)
+        ok = check_syntax(path, new)
+        if not ok[0]:
+            if log_tool_call: log_tool_call("edit", False, {"err": ok[1], "pair": i + 1})
+            return f"Syntax Error (after pair {i + 1}/{n_pairs}): {ok[1]}"
+
+        diff = format_diff(working, new)
+        n_removed, n_added = _count_diff_lines(diff)
+        span_info.append((start_line, end_line, n_removed, n_added))
+        working = new
+
+    # --- Build overall diff (original → final) for display / approval -----------------
+    full_diff = format_diff(original, working)
+    total_removed = sum(r for _, _, r, _ in span_info)
+    total_added   = sum(a for _, _, _, a in span_info)
 
     # Approval prompt (only for escape paths when not in auto mode)
     if _is_path_escape(cwd, path) and not auto_mode:
         from display import BOLD, RESET
-        _print_diff(diff)
+        _print_diff(full_diff)
         print(f"{BOLD}(Approve? y/n): {RESET}", end="", flush=True)
         try:
             if input().strip().lower() != 'y':
@@ -85,17 +103,25 @@ def execute_edit(act: dict, cwd: str, auto_mode: bool, sandbox: bool, log_tool_c
             if log_tool_call: log_tool_call("edit", False, {"denied": True, "path": path})
             return "Denied by user."
 
-    # Write the file
+    # Write the file once with all changes applied
     allow_escape = _is_path_escape(cwd, path)
-    if write_err := write_file(path, new, cwd, rem, allow_escape=allow_escape, sandbox=sandbox):
+    if write_err := write_file(path, working, cwd, rem, allow_escape=allow_escape, sandbox=sandbox):
         if log_tool_call: log_tool_call("edit", False, {"err": write_err})
         return f"Write failed: {write_err}"
 
-    print(f"\033[36m[Edit] {rem or 'local'} -> {path}: lines {start_line}-{end_line} | replaced {n_removed} lines with {n_added} lines\033[0m")
+    # Build a human-friendly summary
+    if n_pairs == 1:
+        sl, el, nr, na = span_info[0]
+        detail = f"lines {sl}-{el} | replaced {nr} lines with {na} lines"
+    else:
+        ranges = ", ".join(f"{sl}-{el}" for sl, el, _, _ in span_info)
+        detail = f"ranges [{ranges}] | {n_pairs} edits, {total_removed} removed → {total_added} added"
+
+    print(f"\033[36m[Edit] {rem or 'local'} -> {path}: {detail}\033[0m")
 
     if log_tool_call:
-        log_tool_call("edit", True, {"path": path})
-    return f"Successfully edited {path}: lines {start_line}-{end_line} | replaced {n_removed} lines with {n_added} lines"
+        log_tool_call("edit", True, {"path": path, "pairs": n_pairs})
+    return f"Successfully edited {path}: {detail}"
 
 
 def execute_write(act: dict, cwd: str, auto_mode: bool, sandbox: bool, log_tool_call=None) -> str:

@@ -40,18 +40,35 @@ def parse_xml_actions(text: str) -> list[dict[str, Any]]:
         elif tag == "write":
             act["content"] = inner.strip()
         elif tag == "edit":
-            find_m = re.search(r'(?m)^[ \t]*<find>\n([\s\S]*?)\n^[ \t]*</find>', inner)
-            rep_m = re.search(r'(?m)^[ \t]*<replace>\n([\s\S]*?)\n^[ \t]*</replace>', inner)
+            # Collect ALL <find> and <replace> pairs (multi-edit support)
+            _FIND_PAT  = r'(?m)^[ \t]*<find>\n([\s\S]*?)\n^[ \t]*</find>'
+            _REPL_PAT  = r'(?m)^[ \t]*<replace>\n([\s\S]*?)\n^[ \t]*</replace>'
 
-            if not find_m:
-                _log.warning("Malformed <edit>: missing <find> tag in %s", act.get("path", "?"))
+            find_matches  = list(re.finditer(_FIND_PAT, inner))
+            rep_matches   = list(re.finditer(_REPL_PAT, inner))
+
+            if not find_matches:
+                _log.warning("Malformed edit: missing find tag in %s", act.get("path", "?"))
                 continue
-            if not rep_m:
-                _log.warning("Malformed <edit>: missing <replace> tag in %s", act.get("path", "?"))
+            if not rep_matches:
+                _log.warning("Malformed edit: missing replace tag in %s", act.get("path", "?"))
                 continue
 
-            act["find"] = find_m.group(1).strip('\n')
-            act["replace"] = rep_m.group(1).strip('\n')
+            # Pair them by interleaving order (find1,replace1, find2,replace2, ...)
+            finds   = [m.group(1).strip('\n') for m in find_matches]
+            replaces = [m.group(1).strip('\n') for m in rep_matches]
+
+            # If counts differ, warn but use min length
+            n_pairs = min(len(finds), len(replaces))
+            if len(finds) != len(replaces):
+                _log.warning("edit %s: %d find blocks but %d replace blocks – using %d pairs",
+                             act.get("path", "?"), len(finds), len(replaces), n_pairs)
+
+            act["finds"]   = finds[:n_pairs]
+            act["replaces"] = replaces[:n_pairs]
+            # Backward compat: single-edit key still works
+            act["find"]    = finds[0]
+            act["replace"] = replaces[0]
 
         actions.append(act)
 

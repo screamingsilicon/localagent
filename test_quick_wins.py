@@ -9,9 +9,7 @@ from pathlib import Path
 sys.path.insert(0, "/workspace")
 
 
-# ===================================================================
 # 1. BOM Handling Tests
-# ===================================================================
 def test_bom_strip_basic():
     """BOM at start of string is stripped."""
     from file_ops import strip_bom
@@ -68,9 +66,7 @@ def test_edit_with_bom_file():
     assert "universe" in new_content
 
 
-# ===================================================================
 # 2. File Path Extraction Tests (for compaction)
-# ===================================================================
 def test_extract_file_paths_reads():
     """Extract file paths from read operations."""
     from context_manager import _extract_file_paths
@@ -115,9 +111,7 @@ def test_extract_file_paths_deduplicates():
     assert mods.count("app.py") <= 1
 
 
-# ===================================================================
 # 3. Shell Truncation Messaging Tests
-# ===================================================================
 def test_shell_truncation_shows_line_range():
     """Truncated output shows 'Showing lines X-Y of Z'."""
     from shell_executor import execute_shell
@@ -159,9 +153,7 @@ def test_shell_no_truncation_under_threshold():
     assert "world" in result
 
 
-# ===================================================================
 # 4. Context Manager Token Estimation Tests
-# ===================================================================
 def test_estimate_uses_provider_usage():
     """Token estimation prefers provider usage when available."""
     from context_manager import compress_context
@@ -198,9 +190,7 @@ def test_estimate_fallback_char_based():
     assert result_msgs is not None
 
 
-# ===================================================================
 # 5. Incremental Summary Update Tests
-# ===================================================================
 def test_incremental_summary_prompt_structure():
     """Verify that incremental update prompt includes previous summary."""
     from context_manager import compress_context
@@ -230,9 +220,7 @@ def test_incremental_summary_prompt_structure():
     assert isinstance(result_msgs, list)
 
 
-# ===================================================================
 # 6. System Prompt Content Tests
-# ===================================================================
 def test_system_prompt_has_multi_edit_guidance():
     """System prompt instructs model to batch edits."""
     prompt = Path("/workspace/system_prompt.md").read_text()
@@ -249,9 +237,7 @@ def test_system_prompt_has_find_block_guidance():
     assert "small" in prompt.lower() or "minimal" in prompt.lower(), "Should suggest minimal find blocks"
 
 
-# ===================================================================
 # 7. End-to-end: BOM file edit through find_and_replace
-# ===================================================================
 def test_e2e_edit_bom_file():
     """Full flow: read BOM file via read_file, edit via find_and_replace."""
     from file_ops import find_and_replace, normalize_text
@@ -289,9 +275,7 @@ def test_e2e_edit_bom_file_no_bom_in_find():
     assert "VALUE = 2" in new_content
 
 
-# ===================================================================
 # Runner
-# ===================================================================
 def run_tests():
     """Run all tests and report results."""
     import traceback

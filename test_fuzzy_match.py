@@ -12,9 +12,7 @@ import sys
 sys.path.insert(0, "/workspace")
 
 
-# ===================================================================
 # 1. Exact Match Tests
-# ===================================================================
 def test_exact_match_basic():
     """Simple exact match works."""
     from file_ops import find_and_replace
@@ -70,9 +68,7 @@ def test_exact_match_multiple_occurrences():
         assert "multiple" in str(e).lower()
 
 
-# ===================================================================
 # 2. LF-Normalized Match Tests (CRLF vs LF)
-# ===================================================================
 def test_fuzzy_crlf_to_lf():
     """File has CRLF, model sends LF pattern — should match."""
     from file_ops import find_and_replace
@@ -109,9 +105,7 @@ def test_fuzzy_model_crlf_file_lf():
     assert "replaced" in new
 
 
-# ===================================================================
 # 3. Trailing Whitespace Tolerant Tests
-# ===================================================================
 def test_fuzzy_trailing_spaces():
     """File has trailing spaces on lines — should match clean pattern."""
     from file_ops import find_and_replace
@@ -148,9 +142,7 @@ def test_fuzzy_model_has_trailing_file_doesnt():
     assert "replaced" in new
 
 
-# ===================================================================
 # 4. Full Fuzzy Unicode Tests
-# ===================================================================
 def test_fuzzy_smart_single_quotes():
     """File has smart single quotes — should match ASCII apostrophe."""
     from file_ops import find_and_replace
@@ -214,9 +206,7 @@ def test_fuzzy_minus_sign():
     assert "replaced" in new
 
 
-# ===================================================================
 # 5. Model Sends Unicode, File Has ASCII (Reverse Direction)
-# ===================================================================
 def test_fuzzy_model_smart_quotes_file_ascii():
     """Model sends smart quotes, file has ASCII — should match."""
     from file_ops import find_and_replace
@@ -244,9 +234,7 @@ def test_fuzzy_model_emdash_file_hyphen():
     assert "replaced" in new
 
 
-# ===================================================================
 # 6. Combined Fuzzy Tests (Multiple Issues)
-# ===================================================================
 def test_fuzzy_crlf_plus_trailing_ws():
     """File has CRLF + trailing spaces — should match clean LF pattern."""
     from file_ops import find_and_replace
@@ -274,9 +262,7 @@ def test_fuzzy_all_issues_combined():
     assert "replaced" in new
 
 
-# ===================================================================
 # 7. Strict Mode Tests
-# ===================================================================
 def test_strict_mode_rejects_fuzzy():
     """Strict mode should NOT fall back to fuzzy matching."""
     from file_ops import find_and_replace
@@ -298,9 +284,7 @@ def test_strict_mode_accepts_exact():
     assert "replaced" in new
 
 
-# ===================================================================
 # 8. FuzzyMatchResult Unit Tests
-# ===================================================================
 def test_fuzzy_match_result_not_found():
     """FuzzyMatchResult.not_found() returns correct defaults."""
     from file_ops import fuzzy_find, FuzzyMatchResult
@@ -344,9 +328,7 @@ def test_fuzzy_match_result_full_fuzzy_strategy():
     assert result.strategy == "full-fuzzy"
 
 
-# ===================================================================
 # 9. Edge Cases
-# ===================================================================
 def test_fuzzy_single_line_no_newline():
     """Single line without trailing newline."""
     from file_ops import find_and_replace
@@ -403,9 +385,7 @@ def test_fuzzy_preserves_bom_in_output():
     assert "\ufeff" not in new  # BOM was stripped during normalization
 
 
-# ===================================================================
 # 10. Error Message Quality Tests
-# ===================================================================
 def test_error_message_helpful_for_not_found():
     """Error message gives actionable guidance."""
     from file_ops import find_and_replace
@@ -563,9 +543,7 @@ def test_fuzzy_model_sends_extra_blank_line():
         pass  # Expected — structural difference shouldn't fuzzy match
 
 
-# ===================================================================
 # 11. Real-World Scenario Tests
-# ===================================================================
 def test_real_world_python_edit_with_smart_quotes():
     """Realistic Python edit with smart quotes from copy-paste."""
     from file_ops import find_and_replace
@@ -596,9 +574,7 @@ def test_real_world_config_with_nbsp():
     assert "False" in new
 
 
-# ===================================================================
 # Runner
-# ===================================================================
 def run_tests():
     """Run all tests and report results."""
     import traceback

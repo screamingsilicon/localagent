@@ -168,8 +168,161 @@ def fuzzy_find(text: str, pattern: str) -> FuzzyMatchResult:
     return FuzzyMatchResult.not_found()
 
 
+def _annotate_line(line: str) -> str:
+    """Return (display_text, issues) for a single line.
+
+    *display_text* is the original line unchanged (safe to copy-paste).
+    *issues* is a list of human-readable notes about hidden whitespace.
+    """
+    issues = []
+    if "\t" in line:
+        issues.append("contains tab(s)")
+    trailing = len(line) - len(line.rstrip(" \t"))
+    if trailing:
+        spaces = len(line) - len(line.rstrip())
+        tabs_trail = trailing - spaces
+        parts = []
+        if spaces:
+            parts.append(f"{spaces} trailing space{'s' if spaces != 1 else ''}")
+        if tabs_trail:
+            parts.append(f"{tabs_trail} trailing tab{'s' if tabs_trail != 1 else ''}")
+        issues.append(" + ".join(parts))
+    return line, issues
+
+
+def _format_block_with_annotations(text: str, label: str, width: int = 120) -> list[str]:
+    """Format a text block for the error message.
+
+    Shows each line with its 1-based line number and any whitespace
+    anomalies. The actual line content is never modified — safe to copy.
+
+    Returns a list of output lines.
+    """
+    lines = text.split("\n")
+    out: list[str] = [f"{label} ({len(lines)} lines):"]
+    for i, line in enumerate(lines, 1):
+        display = line[:width] + "…" if len(line) > width else line
+        _, issues = _annotate_line(line)
+        tag = f"  [{', '.join(issues)}]" if issues else ""
+        out.append(f"  {i:4d} │{display}{tag}")
+    return out
+
+
+def _closest_block(content: str, pattern: str, n_lines: int = 8) -> tuple[str, int]:
+    """Find the region in *content* most similar to *pattern*.
+
+    Uses ``difflib.SequenceMatcher`` over line-level Ratios. Returns the best
+    matching snippet (up to *n_lines* lines from the file) and its starting
+    1-based line number.
+    """
+    import difflib
+
+    pat_lines = pattern.split("\n")
+    cont_lines = content.split("\n")
+    if not pat_lines or not cont_lines:
+        return "", 0
+
+    best_score = -1.0
+    best_start = 0
+    window = max(len(pat_lines), 4)
+
+    for i in range(len(cont_lines) - window + 1):
+        chunk = cont_lines[i:i + window]
+        ratio = difflib.SequenceMatcher(None, pat_lines, chunk).ratio()
+        if ratio > best_score:
+            best_score = ratio
+            best_start = i
+
+    # Return up to n_lines around the best match
+    start = max(0, best_start)
+    snippet = "\n".join(cont_lines[start:start + n_lines])
+    return snippet, start + 1
+
+
+def _build_mismatch_error(path: str, content: str, pattern: str, strict: bool = False) -> str:
+    """Build a rich diagnostic when the <find> text does not match the file.
+
+    Shows:
+      - The first/last lines of what was searched for (with visible whitespace)
+      - The closest matching region in the actual file (with visible whitespace)
+      - A unified diff between them so the LLM can see exactly what differs
+    """
+    import difflib
+
+    pat_lines = pattern.split("\n")
+    snippet, snippet_line = _closest_block(content, pattern)
+    snippet_lines = snippet.split("\n") if snippet else []
+
+    # Build a unified diff between the pattern and the closest match
+    diff_lines = list(
+        difflib.unified_diff(
+            pat_lines, snippet_lines,
+            fromfile="<find> block (searched for)",
+            tofile=f"{path} (closest match at line {snippet_line})",
+            n=min(3, max(0, len(snippet_lines) - 1)),
+            lineterm="",
+        )
+    )
+
+    # Truncate diff to keep it manageable (~30 lines)
+    if len(diff_lines) > 32:
+        diff_lines = diff_lines[:16] + ["  … (truncated)"] + diff_lines[-14:]
+
+    # Build the annotated blocks (raw text, never modified — safe to copy)
+    pat_block = _format_block_with_annotations(pattern, "Your <find> block")
+    file_block = (
+        _format_block_with_annotations(snippet, f"{path} (closest match at line {snippet_line})")
+        if snippet
+        else ["  (empty file)"]
+    )
+
+    parts: list[str] = [
+        f"Text not found in {path}.",
+        "",
+        "Your <find> block did not match the file content.",
+    ]
+    parts.extend(pat_block)
+    parts.append("")
+    parts.extend(file_block)
+    parts.append("")
+    parts.append("Diff (what differs between your <find> and the file):")
+
+    for dl in diff_lines:
+        parts.append(f"  {dl}")
+
+    # Collect all detected issues across both blocks for targeted tips
+    all_issues: list[str] = []
+    for line in pattern.split("\n"):
+        _, iss = _annotate_line(line)
+        all_issues.extend(iss)
+    for line in (snippet or "").split("\n"):
+        _, iss = _annotate_line(line)
+        all_issues.extend(iss)
+
+    tips: list[str] = []
+    if any("tab" in i for i in all_issues):
+        tips.append("Tab/space mismatch — check indentation consistency.")
+    if any("trailing" in i for i in all_issues):
+        tips.append("Trailing whitespace detected — remove extra spaces/tabs at end of lines.")
+    if not strict and not tips:
+        tips.append("Check indentation (spaces vs tabs) and ensure the <find> block matches exactly.")
+    if strict and not tips:
+        tips.append("Remote edits require an exact match (including whitespace/indentation).")
+    if len(pat_lines) > 10:
+        tips.append("Consider using a smaller <find> block — include just enough to be unique.")
+
+    parts.append("")
+    parts.append("; ".join(tips))
+
+    return "\n".join(parts)
+
+
 def _get_fuzzy_error(path: str, strategy_hint: str | None = None) -> str:
-    """Build a helpful error message for fuzzy match failure."""
+    """Build a helpful error message for fuzzy match failure.
+
+    Deprecated wrapper — callers should pass content/pattern to
+    ``_build_mismatch_error`` for the rich diagnostic.
+    """
     hints = []
     if strategy_hint == "trailing-ws":
         hints.append("Check trailing whitespace on each line.")
@@ -255,18 +408,15 @@ def find_and_replace(
         new_content = content[:exact_idx] + new_text + content[exact_idx + len(old_text):]
         return content, new_content, start_line, end_line
 
-    # Strict mode: no fuzzy fallbacks
+    # Strict mode: no fuzzy fallbacks — but still show rich diagnostic
     if strict:
-        raise ValueError(
-            f"Text not found in {path}. Provide an exact match "
-            "(including whitespace/indentation)."
-        )
+        raise ValueError(_build_mismatch_error(path, content, old_text, strict=True))
 
     # Try progressive fuzzy matching (non-strict mode only)
     result = fuzzy_find(content, old_text)
 
     if not result.found:
-        raise ValueError(_get_fuzzy_error(path))
+        raise ValueError(_build_mismatch_error(path, content, old_text, strict=False))
 
     # Check for uniqueness in the matched content space
     base_content = result.content_for_replace or content
