@@ -32,6 +32,11 @@ def _get_diff_highlighter(path: str):
         ".bash": "bash",
         ".html": "html",
         ".htm": "html",
+        ".json": "json",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+        ".sql": "sql",
+        ".js": "javascript",
     }
     lang = lang_map.get(ext)
     if not lang:
@@ -54,6 +59,11 @@ def _get_highlighter(path: str):
         ".bash": "bash",
         ".html": "html",
         ".htm": "html",
+        ".json": "json",
+        ".yaml": "yaml",
+        ".yml": "yaml",
+        ".sql": "sql",
+        ".js": "javascript",
     }
     lang = lang_map.get(ext)
     if not lang:
@@ -86,11 +96,14 @@ _LANG_ALIASES: dict[str, str] = {
     "html": "html", "htm": "html", "xhtml": "html",
     "xml": "html", "svg": "html", "css": "html",
     
-    "json": None, "yaml": None, "yml": None,
+    "json": "json",
+    "yaml": "yaml", "yml": "yaml",
+    "sql": "sql",
+    "javascript": "javascript", "js": "javascript",
     "toml": None, "ini": None, "cfg": None,
     "diff": None, "patch": None,
     
-    "js": None, "javascript": None, "ts": None, "typescript": None,
+    "ts": None, "typescript": None,
     "go": None, "rust": None, "rs": None,
     "java": None, "c": None, "cpp": None, "cc": None, "cxx": None,
     "ruby": None, "rb": None, "php": None,
@@ -120,6 +133,10 @@ def _resolve_lang(lang_tag: str) -> tuple[str | None, str]:
         "python": "Python",
         "bash": "Bash",
         "html": "HTML",
+        "json": "JSON",
+        "yaml": "YAML",
+        "sql": "SQL",
+        "javascript": "JavaScript",
     }
     display = DISPLAY_NAMES.get(highlighter_name)
     if display is None:

@@ -343,7 +343,7 @@ def read_file(
             from docker_sandbox import docker_exec_read_file
         except ImportError:
             return None, "docker_sandbox not available"
-        resolved = Path(path).resolve(strict=False)
+        resolved = Path(base_dir, Path(path).expanduser()).resolve(strict=False)
         rel = os.path.relpath(resolved, "/workspace")
         cpath = f"/workspace/{rel}"
         content, err = docker_exec_read_file(cpath)
@@ -418,7 +418,7 @@ def write_file(
             )
         except ImportError:
             return "docker_sandbox not available"
-        resolved = Path(path).resolve(strict=False)
+        resolved = Path(base_dir, Path(path).expanduser()).resolve(strict=False)
         rel = os.path.relpath(resolved, "/workspace")
         cpath = f"/workspace/{rel}"
         subprocess.run(
