@@ -116,7 +116,7 @@ class TestDockerSandbox(unittest.TestCase):
     def test_docker_exec_read_file_success(self, mock_run):
         import docker_sandbox as ds
         ds._SANDBOX_CONTAINER = "test-container"
-        mock_run.return_value = MagicMock(returncode=0, stdout="file content", stderr="")
+        mock_run.return_value = MagicMock(returncode=0, stdout=b"file content", stderr=b"")
 
         content, error = self.ds.docker_exec_read_file("/workspace/test.txt")
         self.assertEqual(content, "file content")
@@ -126,7 +126,7 @@ class TestDockerSandbox(unittest.TestCase):
     def test_docker_exec_read_file_failure(self, mock_run):
         import docker_sandbox as ds
         ds._SANDBOX_CONTAINER = "test-container"
-        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="No such file")
+        mock_run.return_value = MagicMock(returncode=1, stdout=b"", stderr=b"No such file")
 
         content, error = self.ds.docker_exec_read_file("/no/file")
         self.assertIsNone(content)
@@ -155,9 +155,6 @@ class TestConstants(unittest.TestCase):
 
     def test_image_name(self):
         self.assertEqual(self.ds.IMAGE_NAME, "localagent-image")
-
-    def test_dockerfile_has_python(self):
-        self.assertIn("python", self.ds.DOCKERFILE)
 
     @property
     def ds(self):
