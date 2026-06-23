@@ -277,7 +277,7 @@ class LocalAgent:
         self.log_message("user", req)
 
         NO_ACTION_NUDGE = "You didn't include any action tags (<shell>, <edit>, or <write>). If you are done, reply with <done/> otherwise continue."
-        
+
         consecutive_no_action = 0
         consecutive_errors = 0
         
@@ -310,6 +310,10 @@ class LocalAgent:
 
                 if not actions:
                     if "<done" in text or "<done/>" in text:
+                        break
+
+                    # In non-auto (REPL) mode, no nudge — just stop and let the user type again
+                    if not self.auto_mode:
                         break
 
                     consecutive_no_action += 1
@@ -346,7 +350,7 @@ class LocalAgent:
                 _log.exception("Error in agent turn – feeding back to LLM")
                 error_msg = f"\033[31m[Error]\033[0m {exc}"
                 print(f"\n{error_msg}")
-                self._session_mgr.log_event("turn_error", detail=str(exc))
+                self._session_mgr.log_event("turn_error", extra={"detail": str(exc)})
 
                 consecutive_errors += 1
                 if consecutive_errors > _MAX_CONSECUTIVE_ERRORS:

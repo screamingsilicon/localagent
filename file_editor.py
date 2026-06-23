@@ -173,9 +173,14 @@ def execute_write(act: dict, cwd: str, auto_mode: bool, sandbox: bool, log_tool_
 
 def _print_highlighted_content(content: str, filename: str, prefix: str = "+", max_lines: int = 10):
     """Print file content with syntax highlighting and line prefixes."""
+    import os
     from highlighters import get_highlighter
 
-    hl = get_highlighter(filename)
+    ext = os.path.splitext(filename)[1].lstrip(".").lower() or "text"
+    try:
+        hl = get_highlighter(ext)
+    except KeyError:
+        hl = None
     lines = content.splitlines()
     for i, line in enumerate(lines[:max_lines], 1):
         highlighted = hl(line) if hl else line
