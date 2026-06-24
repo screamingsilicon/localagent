@@ -15,11 +15,6 @@ from pathlib import Path
 SHELL_MAX_LINES = 1000           # max lines to include in tool result
 SHELL_MAX_BYTES = 64 * 1024      # max bytes (~64KB) to include in tool result
 
-# Burst detection: if lines arrive within this gap (ms), treat as data dump
-# and suppress live output. Gaps larger than this indicate progress/status.
-BURST_GAP_MS = 200
-
-
 def truncate_output(
     raw_text: str,
     max_lines: int = SHELL_MAX_LINES,
@@ -140,23 +135,36 @@ def _print_line(l: str, color_code: str):
 def stream_command_output(exec_cmd: str, color_code: str = "90m", cwd: str = None, sandbox: bool = False, timeout: int = 60) -> tuple[list[str], int]:
     """Stream command output to terminal with optional coloring and timeout.
 
-    Uses timing-based burst detection: if lines arrive within BURST_GAP_MS of
-    each other, output is treated as a data dump (cat, grep, ls) and buffered
-    silently. If gaps exceed the threshold, output is treated as progress/status
-    and streamed live to the terminal.
+    All output is streamed live as it arrives. The process runs in its own
+    session (process group) so that timeouts kill the entire tree including
+    child processes and SSH pipelines.
     """
     if sandbox:
         import docker_sandbox
         return docker_sandbox.docker_exec(exec_cmd)
 
+    import signal
     shell_bin = shutil.which("bash") or "/bin/sh"
-    p = subprocess.Popen(exec_cmd, shell=True, executable=shell_bin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=0, cwd=cwd or os.getcwd())
+    p = subprocess.Popen(exec_cmd, shell=True, executable=shell_bin, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=0, cwd=cwd or os.getcwd(), start_new_session=True)
 
     lines = []
-    buffered_lines = []          # lines collected during burst phase
-    streaming = False             # have we switched to live-stream mode?
-    threshold_s = BURST_GAP_MS / 1000.0
-    prev_ts = None                # timestamp of previous line arrival
+
+    def _kill_process_group():
+        """Kill the entire process group (shell + all children)."""
+        try:
+            pgid = os.getpgid(p.pid)
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            p.wait(timeout=3)
+        except Exception:
+            try:
+                pgid = os.getpgid(p.pid)
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            p.kill()
 
     # Watchdog thread to kill the process if it exceeds timeout
     killed_by_watchdog = threading.Event()
@@ -164,14 +172,7 @@ def stream_command_output(exec_cmd: str, color_code: str = "90m", cwd: str = Non
     def _watchdog():
         time.sleep(timeout)
         if p.poll() is None:
-            try:
-                p.terminate()
-            except Exception:
-                pass
-            try:
-                p.wait(timeout=3)
-            except Exception:
-                p.kill()
+            _kill_process_group()
             killed_by_watchdog.set()
 
     wd = threading.Thread(target=_watchdog, daemon=True)
@@ -180,35 +181,15 @@ def stream_command_output(exec_cmd: str, color_code: str = "90m", cwd: str = Non
     interrupted = False
     try:
         for l in p.stdout:
-            now = time.monotonic()
             text = l.rstrip('\n')
             lines.append(text)
-
-            # Decide burst vs stream based on inter-line gap
-            if prev_ts is not None and not streaming:
-                gap = now - prev_ts
-                if gap > threshold_s:
-                    streaming = True
-                    # Flush buffered lines to screen (they're the "head")
-                    for bl in buffered_lines:
-                        _print_line(bl + "\n", color_code)
-
-            if streaming:
-                _print_line(l, color_code)
-            else:
-                buffered_lines.append(text)
-
-            prev_ts = now
+            _print_line(l, color_code)
 
         p.wait()
     except KeyboardInterrupt:
         interrupted = True
         if p.poll() is None:
-            p.terminate()
-            try:
-                p.wait(timeout=2)
-            except Exception:
-                p.kill()
+            _kill_process_group()
         lines.append("[Interrupted]")
 
     # Determine if the process was killed by the timeout watchdog
