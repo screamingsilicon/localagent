@@ -197,6 +197,7 @@ class LocalAgent:
         self.pending_notes: list[str] = []
         self._compaction_summary = ""
         self._initial_context_sent = False
+        self._repl_nudged = False
 
         # Sudo password cache (for remote SSH)
         self._sudo_cache = _SudoCache()
@@ -276,7 +277,17 @@ class LocalAgent:
         self.messages.append({"role": "user", "content": req})
         self.log_message("user", req)
 
-        NO_ACTION_NUDGE = "You didn't include any action tags (<shell>, <edit>, or <write>). If you are done, reply with <done/> otherwise continue."
+        NO_ACTION_NUDGE = (
+            "You did not include any action tags. Please wrap your actions in XML:\n"
+            "<shell>command</shell>\n"
+            '<edit path="file.py">\n'
+            "  <find>...old text...</find>\n"
+            "  <replace>...new text...</replace>\n"
+            "</edit>\n"
+            '<write path="file.py">content</write>\n'
+            "If you are done, reply with <done/>."
+        )
+        self._repl_nudged = False
 
         consecutive_no_action = 0
         consecutive_errors = 0
@@ -312,8 +323,13 @@ class LocalAgent:
                     if "<done" in text or "<done/>" in text:
                         break
 
-                    # In non-auto (REPL) mode, no nudge — just stop and let the user type again
+                    # In non-auto (REPL) mode, nudge once then return to user
                     if not self.auto_mode:
+                        if not self._repl_nudged:
+                            self._repl_nudged = True
+                            print(f"\n\033[90m⚡ No actions found — asking agent to retry...\033[0m")
+                            self.messages.append({"role": "user", "content": NO_ACTION_NUDGE})
+                            continue
                         break
 
                     consecutive_no_action += 1
@@ -325,7 +341,6 @@ class LocalAgent:
                     continue
 
                 consecutive_no_action = 0
-                consecutive_errors = 0
                 print()
                 results = []
                 for a in actions:
@@ -333,8 +348,15 @@ class LocalAgent:
                         results.append(self.execute_shell_action(a))
                     elif a["type"] == "edit":
                         results.append(self.execute_edit_action(a))
+                    elif a["type"] == "error":
+                        consecutive_errors += 1
+                        results.append(f"\033[31m[Parse Error]\033[0m {a['message']}")
                     else:
                         results.append(self.execute_write_action(a))
+
+                if consecutive_errors > _MAX_CONSECUTIVE_ERRORS:
+                    print(f"\n\033[33m⚠ Too many consecutive errors ({_MAX_CONSECUTIVE_ERRORS}). Giving up.\033[0m")
+                    break
 
                 self.messages.append({"role": "user", "content": "### Action Results\n\n" + "\n\n---\n\n".join(results)})
                 # Only compact when context is getting large

@@ -9,13 +9,26 @@ _log = logging.getLogger("localagent")
 
 
 def parse_xml_actions(text: str) -> list[dict[str, Any]]:
-    """Parse <shell>, <edit>, and <write> XML action tags from LLM output."""
+    """Parse <shell>, <edit>, and <write> XML action tags from LLM output.
+
+    Returns a list of action dicts.  If the response contains an <edit> or
+    <write> tag that doesn't have a ``path=`` attribute, a parse-error action
+    is emitted so the agent gets specific feedback instead of a generic nudge.
+    """
     actions = []
 
+    # Outer tags that *do* match the full pattern (have path= for edit/write)
     pattern = (
         r'(?m)'
         r'<(shell)\b([^>]*)>([\s\S]*?)</\1>|'
         r'^[ \t]*<(edit|write)\b(?=[^>]*\bpath="[^"]+")([^>]*)>\n([\s\S]*?)\n^[ \t]*</\4>'
+    )
+
+    # Detect truncated / unclosed <edit> or <write> tags (opening tag present but
+    # no matching closing tag).  These won't match the main pattern above and would
+    # otherwise fall through to the generic "no actions" nudge.
+    _unclosed_edit_write = re.compile(
+        r'(?m)^[ \t]*<(edit|write)\b([^>]*?)>',
     )
 
     for m in re.finditer(pattern, text):
@@ -47,11 +60,15 @@ def parse_xml_actions(text: str) -> list[dict[str, Any]]:
             find_matches  = list(re.finditer(_FIND_PAT, inner))
             rep_matches   = list(re.finditer(_REPL_PAT, inner))
 
-            if not find_matches:
-                _log.warning("Malformed edit: missing find tag in %s", act.get("path", "?"))
-                continue
-            if not rep_matches:
-                _log.warning("Malformed edit: missing replace tag in %s", act.get("path", "?"))
+            if not find_matches or not rep_matches:
+                missing = []
+                if not find_matches:
+                    missing.append("<find>")
+                if not rep_matches:
+                    missing.append("<replace>")
+                err_msg = f"Malformed edit on {act.get('path', '?')}: missing {', '.join(missing)} block(s)"
+                _log.warning(err_msg)
+                actions.append({"type": "error", "message": err_msg})
                 continue
 
             # Pair them by interleaving order (find1,replace1, find2,replace2, ...)
@@ -71,5 +88,30 @@ def parse_xml_actions(text: str) -> list[dict[str, Any]]:
             act["replace"] = replaces[0]
 
         actions.append(act)
+
+
+    # Catch any <edit> or <write> opening tag that the main pattern didn't match.
+    # These are malformed (missing path=, missing find/replace, truncated, etc.)
+    # and should produce a specific error instead of the generic "no actions" nudge.
+    _main_starts = {m.start() for m in re.finditer(pattern, text)}
+    already_reported: set[str] = set()
+    for om in _unclosed_edit_write.finditer(text):
+        tag_name = om.group(1)
+        attrs_str = om.group(2)
+        # Skip if this was already successfully parsed by the main pattern
+        if om.start() in _main_starts:
+            continue
+        path_m = re.search(r'\bpath="([^"]+)"', attrs_str)
+        path_val = path_m.group(1) if path_m else "?"
+        key = f"{tag_name}@{om.start()}"
+        if key not in already_reported:
+            already_reported.add(key)
+            close_tag = f"</{tag_name}>"
+            if close_tag not in text[om.end():]:
+                err_msg = f"Truncated <{tag_name}> tag on {path_val}: missing closing </{tag_name}>"
+            else:
+                err_msg = f"Malformed <{tag_name}> tag on {path_val}: could not parse (check path= attribute and required inner blocks)"
+            _log.warning(err_msg)
+            actions.append({"type": "error", "message": err_msg})
 
     return actions
