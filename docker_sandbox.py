@@ -188,9 +188,12 @@ def docker_exec(cmd: str, cwd: Optional[str] = None, timeout: int = 60) -> Tuple
     timed_out = killed_by_watchdog.is_set() or (p.returncode is not None and p.returncode < 0 and not interrupted)
 
     if timed_out and "[Timed out]" not in "\n".join(lines):
-        lines.append("[Timed out after {}s]".format(timeout))
+        lines.append("[⏱ Timed out after {}s — process was killed]".format(timeout))
 
-    return lines, p.returncode
+    # Return exit code 124 (standard Linux `timeout` convention) when timed out
+    return_code = 124 if timed_out else p.returncode
+
+    return lines, return_code
 
 
 def docker_exec_file_write(path: str, content: str) -> int:

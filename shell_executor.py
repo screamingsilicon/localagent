@@ -196,9 +196,12 @@ def stream_command_output(exec_cmd: str, color_code: str = "90m", cwd: str = Non
     timed_out = killed_by_watchdog.is_set() or (p.returncode is not None and p.returncode < 0 and not interrupted)
 
     if timed_out and "[Timed out]" not in "\n".join(lines):
-        lines.append("[Timed out after {}s]".format(timeout))
+        lines.append("[⏱ Timed out after {}s — process was killed]".format(timeout))
 
-    return lines, p.returncode
+    # Return exit code 124 (standard Linux `timeout` convention) when timed out
+    return_code = 124 if timed_out else p.returncode
+
+    return lines, return_code
 
 
 class _SudoCache:
@@ -312,4 +315,11 @@ def execute_shell(act: dict, auto_mode: bool, cwd: str, sandbox: bool, sudo_cach
 
     if log_tool_call:
         log_tool_call("shell", rcode == 0, {"cmd": cmd})
-    return f"Command: {cmd}\nExit Code: {rcode}\nOutput:\n{out}"
+
+    result = f"Command: {cmd}\nExit Code: {rcode}\nOutput:\n{out}"
+
+    # Add explicit timeout notice for the agent when exit code is 124
+    if rcode == 124:
+        result += "\n\n⚠️ The command was killed due to exceeding the time limit."
+
+    return result
