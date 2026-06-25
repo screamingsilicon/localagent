@@ -20,7 +20,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         prog="localagent",
         description="localagent – AI-powered terminal agent for shell execution, file editing, and writing.",
-        epilog="Examples:\n  %(prog)s                Start interactive REPL\n  %(prog)s --yolo                 Start in auto-execute mode\n  %(prog)s --sandbox              Run inside a secure Docker sandbox\n  %(prog)s \"fix the auth bug\"     One-shot: run a task and exit\n",
+        epilog="Examples:\n  %(prog)s                       Start interactive REPL\n  %(prog)s --yolo                  Start in auto-execute mode\n  %(prog)s --sandbox               Run inside a secure Docker sandbox\n  %(prog)s \"fix the auth bug\"      One-shot: run a task and exit\n  %(prog)s -A CLAUDE.md            Load CLAUDE.md instead of AGENTS.md\n  %(prog)s -A CLAUDE.md -A ROO.md  Load multiple instruction files\n  %(prog)s --session-log /tmp/chat.jsonl  Store session log at custom path\n  %(prog)s -L /tmp/chat.jsonl      Load a previous session from a JSONL file\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("-y", "--yolo", action="store_true", help="Enable auto-execute mode (skip y/n confirmations)")
@@ -31,6 +31,13 @@ def parse_args(argv=None):
     parser.add_argument("--model", default=None, help="Model name (overrides LLM_MODEL env var)")
     parser.add_argument("--temperature", type=float, default=None, help="Temperature for LLM responses (overrides LLM_TEMPERATURE env var)")
     parser.add_argument("--n-ctx", type=int, default=None, help="Context window size (overrides LLM_N_CTX env var)")
+    parser.add_argument("-A", "--agents-file", action="append", default=None, dest="agents_files",
+                        help="Path to agent instructions file(s) to load into system prompt. "
+                             "Can be specified multiple times. Overrides default AGENTS.md scanning.")
+    parser.add_argument("--session-log", default=None, dest="session_log_path",
+                        help="Full path for the session log JSONL file (overrides default ~/.localagent/logs/...)")
+    parser.add_argument("-L", "--load-session", default=None, dest="load_session_path",
+                        help="Load a previous session from a JSONL file path at startup")
     parser.add_argument("-V", "--version", action="version", version=f"%(prog)s v{CLI_VERSION}")
     parser.add_argument("task", nargs="?", default=None, help="One-shot task: run it and exit")
     return parser.parse_args(argv)
@@ -78,6 +85,21 @@ class _Config:
     @classmethod
     def task(cls):
         return cls.args().task
+
+    @classmethod
+    def agents_files(cls) -> list[str] | None:
+        """Return user-specified agent instruction file paths, or None to use defaults."""
+        return cls.args().agents_files
+
+    @classmethod
+    def session_log_path(cls) -> str | None:
+        """Return user-specified session log JSONL path, or None for default."""
+        return cls.args().session_log_path
+
+    @classmethod
+    def load_session_path(cls) -> str | None:
+        """Return user-specified session JSONL path to load at startup, or None."""
+        return cls.args().load_session_path
 
     @classmethod
     def llm_host(cls):

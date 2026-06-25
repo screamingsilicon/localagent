@@ -60,7 +60,7 @@ def run_repl(agent):
             if cmd in ("/exit", "/quit"):
                 break
             elif cmd == "/help":
-                print(f"{H2_COLOR}Available Commands:{RESET}\n  {BOLD}!cmd{RESET}       Run `cmd` locally and optionally add output to context\n  {BOLD}/sessions{RESET} List recent conversation sessions\n  {BOLD}/load <id>{RESET} Load a previous session by its number or ID\n  {BOLD}/clear{RESET}     Clear conversation history (keeps system prompt)\n  {BOLD}/auto{RESET}      Toggle auto-execute mode\n  {BOLD}/host URL{RESET}  Change LLM host\n  {BOLD}/exit{RESET}      Quit the agent")
+                print(f"{H2_COLOR}Available Commands:{RESET}\n  {BOLD}!cmd{RESET}          Run `cmd` locally and optionally add output to context\n  {BOLD}/sessions{RESET}     List recent conversation sessions\n  {BOLD}/load <id|path>{RESET} Load a previous session by number, ID, or full JSONL path\n  {BOLD}/clear{RESET}         Clear conversation history (keeps system prompt)\n  {BOLD}/auto{RESET}         Toggle auto-execute mode\n  {BOLD}/host URL{RESET}      Change LLM host\n  {BOLD}/exit{RESET}          Quit the agent")
             elif cmd == "/sessions":
                 print(f"\033[36mRecent conversations:\033[0m")
                 from display import format_relative_time
@@ -88,15 +88,31 @@ def run_repl(agent):
                         setattr(_Config, attr, None)
                     print(f"\033[32mLLM host changed to: {new_host}\033[0m")
             elif cmd == "/load":
-                sessions = agent.list_sessions()
-                s_id = sessions[int(arg.strip()) - 1]["id"] if arg.strip().isdigit() and 0 <= int(arg.strip()) - 1 < len(sessions) else arg.strip()
-                try:
-                    loaded = agent._session_mgr.load_session(s_id)
-                    agent.messages = [agent.messages[0]] + loaded
-                    agent._initial_context_sent = True
-                    print(f"\033[32mLoaded {len(loaded)} messages.\033[0m")
-                except Exception:
-                    print(f"\033[31mSession not found.\033[0m")
+                arg = arg.strip()
+                if not arg:
+                    print("\033[90mUsage: /load <number | id | path.jsonl>\033[0m")
+                else:
+                    try:
+                        # If it's a number, resolve to session ID from the list
+                        if arg.isdigit():
+                            sessions = agent.list_sessions()
+                            idx = int(arg) - 1
+                            if 0 <= idx < len(sessions):
+                                s_id = sessions[idx]["id"]
+                            else:
+                                print(f"\033[31mIndex {arg} out of range (1-{len(sessions)}).\033[0m")
+                                continue
+                        else:
+                            s_id = arg
+
+                        loaded = agent._session_mgr.load_session(s_id)
+                        agent.messages = [agent.messages[0]] + loaded
+                        agent._initial_context_sent = True
+                        print(f"\033[32mLoaded {len(loaded)} messages.\033[0m")
+                    except FileNotFoundError as e:
+                        print(f"\033[31m{e}\033[0m")
+                    except Exception as e:
+                        print(f"\033[31mError loading session: {e}\033[0m")
 
         else:
             set_terminal_title(f"⏳ localagent")
@@ -105,5 +121,10 @@ def run_repl(agent):
             except KeyboardInterrupt:
                 print(f"\n\033[33m⚠ Turn interrupted (Ctrl+C). Session preserved. Type a new request or /exit.\033[0m")
 
-    print("\nGoodbye!")
+    print()
+    # Show the current session file path so the user can reload it
+    session_file = str(agent._session_mgr.session_file)
+    load_cmd = f"{APP_NAME} -L {session_file}"
+    print(f"\033[90mSession saved to: {session_file}\033[0m")
+    print(f"To continue this conversation:\n  \033[1;36m{load_cmd}\033[0m\n")
     set_terminal_title("")

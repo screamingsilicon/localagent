@@ -179,18 +179,34 @@ class LocalAgent:
         self.sandbox = sandbox
         self.cwd = "/workspace" if sandbox else os.getcwd()
 
-        # Session / logging
-        self._session_mgr = SessionManager(self.cwd)
+        # Session / logging — allow user to override log path via --session-log
+        session_log_path = _Config.session_log_path()
+        self._session_mgr = SessionManager(self.cwd, log_path=session_log_path)
 
         # Build system prompt
         sys_prompt = _Config.system_prompt()
         _loaded_agents: list[str] = []
-        for p in [Path("AGENTS.md"), Path.home() / ".localagent" / "AGENTS.md"]:
-            if p.exists():
-                sys_prompt += f"\n\n### AGENTS.md ({p})\n{p.read_text('utf-8').strip()}"
-                _loaded_agents.append(str(p))
-        if len(_loaded_agents) > 1:
-            _log.info("Loaded %d AGENTS.md files: %s", len(_loaded_agents), _loaded_agents)
+
+        # Agent instruction files: use --agents-file if provided, else scan defaults
+        agent_files = _Config.agents_files()
+        if agent_files:
+            # User explicitly specified file(s); ignore default AGENTS.md scanning
+            for fp in agent_files:
+                p = Path(fp)
+                if p.exists():
+                    fname = p.name
+                    sys_prompt += f"\n\n### {fname} ({p})\n{p.read_text('utf-8').strip()}"
+                    _loaded_agents.append(str(p))
+                else:
+                    _log.warning("Agents file not found, skipping: %s", fp)
+        else:
+            # Default behaviour: scan for AGENTS.md in cwd and ~/.localagent/
+            for p in [Path("AGENTS.md"), Path.home() / ".localagent" / "AGENTS.md"]:
+                if p.exists():
+                    sys_prompt += f"\n\n### AGENTS.md ({p})\n{p.read_text('utf-8').strip()}"
+                    _loaded_agents.append(str(p))
+        if _loaded_agents:
+            _log.info("Loaded %d agent instruction file(s): %s", len(_loaded_agents), _loaded_agents)
 
         # Conversation state
         self.messages = [{"role": "system", "content": sys_prompt}]
@@ -201,6 +217,17 @@ class LocalAgent:
 
         # Sudo password cache (for remote SSH)
         self._sudo_cache = _SudoCache()
+
+        # Load session from JSONL path if --load-session was specified
+        load_path = _Config.load_session_path()
+        if load_path:
+            try:
+                loaded = self._session_mgr.load_session_from_path(load_path)
+                self.messages.extend(loaded)
+                self._initial_context_sent = True
+                print(f"\033[32mLoaded {len(loaded)} messages from {load_path}\033[0m")
+            except FileNotFoundError:
+                print(f"\033[31mSession file not found: {load_path}\033[0m")
 
     # -- Logging helpers (delegate to SessionManager) -------------------------
 
