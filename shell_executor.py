@@ -141,7 +141,7 @@ def stream_command_output(exec_cmd: str, color_code: str = "90m", cwd: str = Non
     """
     if sandbox:
         import docker_sandbox
-        return docker_sandbox.docker_exec(exec_cmd)
+        return docker_sandbox.docker_exec(exec_cmd, timeout=timeout)
 
     import signal
     shell_bin = shutil.which("bash") or "/bin/sh"

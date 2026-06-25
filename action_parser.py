@@ -45,7 +45,7 @@ def parse_xml_actions(text: str) -> list[dict[str, Any]]:
             "type": tag,
             "remote": remote_m.group(1) if remote_m else None,
             "path": path_m.group(1) if path_m else "",
-            "timeout": int(timeout_m.group(1)) if timeout_m else 60,
+            "timeout": max(1, min(int(timeout_m.group(1)), 600)) if timeout_m else 60,
         }
 
         if tag == "shell":

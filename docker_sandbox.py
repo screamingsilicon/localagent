@@ -116,17 +116,21 @@ def _teardown_sandbox() -> None:
         )
 
 
-def docker_exec(cmd: str, cwd: Optional[str] = None) -> Tuple[list[str], int]:
+def docker_exec(cmd: str, cwd: Optional[str] = None, timeout: int = 60) -> Tuple[list[str], int]:
     """Execute a command inside the sandbox container, streaming output.
 
     Args:
         cmd: Shell command to run.
         cwd: Working directory (unused — always /workspace). Kept for API
              compatibility with the local-path version.
+        timeout: Seconds before killing the process (default 60).
 
     Returns:
         Tuple of (list-of-output-lines, return-code).
     """
+    import signal
+    import threading
+
     docker_cmd = ["docker", "exec", "-i", _SANDBOX_CONTAINER, "sh", "-c", cmd]
     p = subprocess.Popen(
         docker_cmd,
@@ -137,6 +141,34 @@ def docker_exec(cmd: str, cwd: Optional[str] = None) -> Tuple[list[str], int]:
         errors="replace",
     )
     lines: list[str] = []
+
+    def _kill_process():
+        """Terminate (then kill) the docker exec process."""
+        try:
+            p.terminate()
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            p.wait(timeout=3)
+        except Exception:
+            try:
+                p.kill()
+            except (ProcessLookupError, OSError):
+                pass
+
+    # Watchdog thread to kill the process if it exceeds timeout
+    killed_by_watchdog = threading.Event()
+
+    def _watchdog():
+        time.sleep(timeout)
+        if p.poll() is None:
+            _kill_process()
+            killed_by_watchdog.set()
+
+    wd = threading.Thread(target=_watchdog, daemon=True)
+    wd.start()
+
+    interrupted = False
     try:
         for line in p.stdout:
             lines.append(line.rstrip("\n"))
@@ -147,12 +179,17 @@ def docker_exec(cmd: str, cwd: Optional[str] = None) -> Tuple[list[str], int]:
             )
         p.wait()
     except KeyboardInterrupt:
-        p.terminate()
-        try:
-            p.wait(timeout=2)
-        except Exception:
-            p.kill()
+        interrupted = True
+        if p.poll() is None:
+            _kill_process()
         lines.append("[Interrupted]")
+
+    # Determine if the process was killed by the timeout watchdog
+    timed_out = killed_by_watchdog.is_set() or (p.returncode is not None and p.returncode < 0 and not interrupted)
+
+    if timed_out and "[Timed out]" not in "\n".join(lines):
+        lines.append("[Timed out after {}s]".format(timeout))
+
     return lines, p.returncode
 
 
